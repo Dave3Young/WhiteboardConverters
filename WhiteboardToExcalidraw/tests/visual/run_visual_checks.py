@@ -1,0 +1,458 @@
+"""
+Geometric checks for the Whiteboard -> Excalidraw converters.
+
+For every sample export and both converter scripts this:
+  1. converts the export with an *instrumented temporary copy* of the converter (the only
+     change is one printed line recording the scene's normalisation offset, so board
+     coordinates can be recovered exactly -- the scripts in the repo are never modified);
+  2. renders the Whiteboard HTML in headless Chromium and measures where Whiteboard really
+     puts every text, sticker, note, image, shape outline, connector and arrowhead;
+  3. reads the .excalidraw scene and places the same things the way Excalidraw does (text
+     is laid out in Chromium with Excalidraw's font size, line height, width and alignment);
+  4. writes tests/out/visual/results.json and exits non-zero if any tolerance is exceeded.
+
+Only dependency: Playwright (pip install playwright; python -m playwright install chromium).
+Run tests/Setup-VisualTests.ps1 once to set that up in tests/.venv.
+
+Usage (from the repo root):
+    tests\\.venv\\Scripts\\python tests\\visual\\run_visual_checks.py
+    ... --sample AssumptionGrid ImageBoard --version solid
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+REPO = Path(__file__).resolve().parents[2]
+VERSIONS = ("solid", "gradient")
+
+# Pass/fail tolerances in board pixels.
+TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "image": 0.5, "shape": 1.5, "connector": 0.5, "arrow": 0.5}
+ARROW_ANGLE_TOL = 2.0   # degrees between Whiteboard's chevron axis and the arrow's end segment
+
+
+# ----------------------------------------------------------------------------------------
+# Conversion with an instrumented copy of the converter
+# ----------------------------------------------------------------------------------------
+OFFSET_ANCHOR = "        $scene = [ordered]@{"
+OFFSET_LINE = ("        [Console]::Out.WriteLine(('TESTOFFSET {0} {1} {2}' -f "
+               "$minX.ToString([Globalization.CultureInfo]::InvariantCulture), "
+               "$minY.ToString([Globalization.CultureInfo]::InvariantCulture), "
+               "$CanvasPadding.ToString([Globalization.CultureInfo]::InvariantCulture)))")
+
+
+def instrument(script: Path, dest: Path) -> Path:
+    raw = script.read_bytes().decode("utf-8-sig")
+    if "TESTOFFSET" not in raw:
+        nl = "\r\n" if "\r\n" in raw else "\n"
+        if raw.count(OFFSET_ANCHOR) != 1:
+            raise SystemExit(f"Can't instrument {script.name}: scene writer not found.")
+        raw = raw.replace(OFFSET_ANCHOR, OFFSET_LINE + nl + OFFSET_ANCHOR, 1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(raw.encode("utf-8-sig"))   # BOM keeps Windows PowerShell 5.1 on UTF-8
+    return dest
+
+
+def find_powershell(explicit: str | None) -> list[str]:
+    if explicit:
+        return [explicit]
+    candidates = ["powershell.exe", "pwsh"] if platform.system() == "Windows" else ["pwsh"]
+    for c in candidates:
+        if shutil.which(c):
+            return [c]
+    raise SystemExit("No PowerShell found (looked for: %s)." % ", ".join(candidates))
+
+
+def convert(ps: list[str], script: Path, html: Path, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # -Command with the call operator rather than -File: with stdin redirected (CI, IDE and agent
+    # shells), "powershell.exe -File" feeds stdin to the script as pipeline input, so the
+    # converter's process {} block runs once per stdin line -- zero times for empty stdin.
+    q = lambda s: "'" + str(s).replace("'", "''") + "'"
+    cmd = ps + ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                f"& {q(script)} -InputPath {q(html)} -OutputDirectory {q(out_dir)} -Force; exit $LASTEXITCODE"]
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    scene = out_dir / (html.stem + ".excalidraw")
+    log = (p.stdout + p.stderr).strip()
+    m = re.search(r"TESTOFFSET (\S+) (\S+) (\S+)", p.stdout)
+    if p.returncode != 0 or not scene.exists() or not m:
+        return None, None, log
+    min_x, min_y, pad = (float(v) for v in m.groups())
+    # scene = board - min + pad  ->  board = scene + (min - pad)
+    return scene, (min_x - pad, min_y - pad), log
+
+
+# ----------------------------------------------------------------------------------------
+# Whiteboard side: measure the export in the browser
+# ----------------------------------------------------------------------------------------
+JS_HTML = r"""() => {
+  const cal = [], texts = [], stickers = [], shapes = [], arrows = [], connectors = [], notes = [], images = [];
+  const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
+  const box = r => [r.left + scrollX, r.top + scrollY, r.width, r.height];
+  document.querySelectorAll('div.anchor[data-whiteboard-type]').forEach(a => {
+    const st = a.getAttribute('style') || '', r = a.getBoundingClientRect();
+    const L = /left:\s*(-?[\d.]+)px/.exec(st), T = /top:\s*(-?[\d.]+)px/.exec(st);
+    if (L && T && !/transform/.test(st)) cal.push([+L[1], +T[1], r.left + scrollX, r.top + scrollY]);
+    const type = a.dataset.whiteboardType;
+    const spans = [...a.querySelectorAll('span[data-text="true"]')];
+    const t = spans.map(s => s.textContent).join('');
+    if (t.trim()) {
+      const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
+      rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
+      const b = rg.getBoundingClientRect();
+      texts.push({type, text: t, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height});
+    }
+    if (type === 'ReactionStickers') stickers.push(box(a.querySelector('img').getBoundingClientRect()));
+    if (type === 'Image' || type === 'AzureImage') images.push(box(a.querySelector('img').getBoundingClientRect()));
+    if (type === 'Note') notes.push(box(a.querySelector('.textBoxBackground').getBoundingClientRect()));
+    if (type === 'Shape') {
+      const svg = a.querySelector('svg.shape'), p = svg && svg.querySelector('g > path');
+      if (p) {
+        const len = p.getTotalLength(), n = Math.max(200, Math.ceil(len / 2)), m = p.getScreenCTM(), pts = [];
+        for (let i = 0; i < n; i++) { const q = p.getPointAtLength(len * i / n); pts.push(pt(m, q.x, q.y)); }
+        shapes.push({label: (svg.getAttribute('aria-label') || '').split(',')[0], pts});
+      }
+    }
+    if (type === 'Connector') {
+      const line = a.querySelector('svg g path:not([transform])');
+      if (line) {
+        const m = line.getScreenCTM(), n = line.getTotalLength(), q0 = line.getPointAtLength(0), q1 = line.getPointAtLength(n);
+        connectors.push([pt(m, q0.x, q0.y), pt(m, q1.x, q1.y)]);
+      }
+      a.querySelectorAll('svg g path[transform]').forEach(p => {
+        const m = p.getScreenCTM(), n = p.getTotalLength();
+        arrows.push([0, n / 2, n].map(l => { const q = p.getPointAtLength(l); return pt(m, q.x, q.y); }));
+      });
+    }
+  });
+  return {cal, texts, stickers, shapes, arrows, connectors, notes, images};
+}"""
+
+
+def linfit(xs, ys):
+    n = len(xs); mx = sum(xs) / n; my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    k = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return k, my - k * mx
+
+
+def measure_html(page, html: Path) -> dict:
+    page.goto(html.as_uri()); page.wait_for_timeout(1200)
+    d = page.evaluate(JS_HTML)
+    if len(d["cal"]) < 2:
+        raise RuntimeError("fewer than 2 untransformed anchors; can't map screen to board coordinates")
+    kx, ox = linfit([c[0] for c in d["cal"]], [c[2] for c in d["cal"]])
+    ky, oy = linfit([c[1] for c in d["cal"]], [c[3] for c in d["cal"]])
+    to_b = lambda x, y: ((x - ox) / kx, (y - oy) / ky)
+    to_box = lambda b: (*to_b(b[0], b[1]), b[2] / kx, b[3] / ky)
+    return {
+        "texts": [dict(t, bx=to_b(t["x"], t["y"])[0], by=to_b(t["x"], t["y"])[1], bw=t["w"] / kx, bh=t["h"] / ky)
+                  for t in d["texts"]],
+        "stickers": [to_box(s) for s in d["stickers"]],
+        "notes": [to_box(s) for s in d["notes"]],
+        "images": [to_box(s) for s in d["images"]],
+        "shapes": [{"label": s["label"], "pts": [to_b(*q) for q in s["pts"]]} for s in d["shapes"]],
+        "connectors": [[to_b(*q) for q in c] for c in d["connectors"]],
+        "arrows": [[to_b(*q) for q in a] for a in d["arrows"]],
+    }
+
+
+# ----------------------------------------------------------------------------------------
+# Excalidraw side: place the scene's elements the way Excalidraw draws them
+# ----------------------------------------------------------------------------------------
+# Excalidraw font families (FONT_METADATA in @excalidraw/common): CSS font stack plus the metrics
+# Excalidraw lays text out with (unitsPerEm, ascender, descender). Helvetica falls back to Arial
+# on Windows, the same face Whiteboard's "sans-serif" resolves to.
+FONTS = {1: ("Virgil, 'Segoe UI Emoji'", 1000, 886, -374),
+         2: ("Helvetica, sans-serif, 'Segoe UI Emoji'", 2048, 1577, -471),
+         3: ("Cascadia, 'Cascadia Code', monospace", 2048, 1900, -480)}
+
+# Excalidraw draws each line with fillText at textBaseline "alphabetic", the first baseline at
+# y + (lineHeightPx - fontSize*(ascender - descender)/unitsPerEm) / 2 + fontSize*ascender/unitsPerEm
+# (getVerticalOffset). A CSS box puts it at (lineHeightPx - (fontAscent + fontDescent)) / 2 +
+# fontAscent instead, so each emulated text is shifted by the difference; the text's range box
+# then sits where Excalidraw's glyphs are. Rotation is applied about the box centre, as
+# Excalidraw does.
+JS_TEXT = r"""(els) => {
+  document.body.innerHTML = ''; document.body.style.margin = '0';
+  const ctx = document.createElement('canvas').getContext('2d');
+  return els.map(e => {
+    const lh = e.lineHeight * e.fontSize;
+    ctx.font = `${e.fontSize}px ${e.font}`;
+    const m = ctx.measureText('Hg');
+    const cssBase = (lh - (m.fontBoundingBoxAscent + m.fontBoundingBoxDescent)) / 2 + m.fontBoundingBoxAscent;
+    const exBase = (lh - e.fontSize * (e.asc - e.desc) / e.upem) / 2 + e.fontSize * e.asc / e.upem;
+    const d = document.createElement('div');
+    d.style.cssText = `position:absolute;left:${e.x}px;top:${e.y}px;width:${e.width}px;font-size:${e.fontSize}px;` +
+      `font-family:${e.font};line-height:${lh}px;text-align:${e.textAlign};white-space:pre-wrap;` +
+      `overflow-wrap:break-word;transform-origin:center;` +
+      `transform:rotate(${e.angle || 0}rad) translateY(${exBase - cssBase}px);margin:0;padding:0`;
+    d.textContent = e.text; document.body.appendChild(d);
+    const rg = document.createRange(); rg.selectNodeContents(d);
+    const b = rg.getBoundingClientRect();
+    return {text: e.originalText, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height,
+            align: e.textAlign, angle: e.angle || 0};
+  });
+}"""
+
+
+def rotate_about(p, c, angle):
+    s, co = math.sin(angle), math.cos(angle)
+    dx, dy = p[0] - c[0], p[1] - c[1]
+    return (c[0] + dx * co - dy * s, c[1] + dx * s + dy * co)
+
+
+def outline(e, off):
+    x, y, w, h, a = e["x"] + off[0], e["y"] + off[1], e["width"], e["height"], e.get("angle", 0) or 0
+    c = (x + w / 2, y + h / 2)
+    t = e["type"]
+    if t == "rectangle":
+        pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    elif t == "diamond":
+        pts = [(x + w / 2, y), (x + w, y + h / 2), (x + w / 2, y + h), (x, y + h / 2)]
+    elif t == "ellipse":
+        pts = [(c[0] + w / 2 * math.cos(2 * math.pi * i / 180), c[1] + h / 2 * math.sin(2 * math.pi * i / 180)) for i in range(180)]
+    else:   # closed polygon "line"
+        pts = [(x + p[0], y + p[1]) for p in e["points"][:-1]]
+    return [rotate_about(p, c, a) for p in pts]
+
+
+def is_shape(e):
+    if e["type"] in ("ellipse", "diamond"):
+        return True
+    if e["type"] == "rectangle":   # notes are rounded (solid) or grouped bands (gradient)
+        return not e.get("roundness") and not e.get("groupIds")
+    return e["type"] == "line" and bool(e.get("polygon"))
+
+
+def measure_scene(page, scene_path: Path, off) -> dict:
+    scene = json.loads(scene_path.read_text(encoding="utf-8"))
+    els = [e for e in scene["elements"] if not e.get("isDeleted")]
+    files = scene.get("files", {})
+
+    def bx(e):
+        """Board-space bounds of an element, after Excalidraw rotates it about its centre
+        (the browser's bounding box of a rotated Whiteboard object is measured the same way)."""
+        x, y, w, h = e["x"] + off[0], e["y"] + off[1], e["width"], e["height"]
+        a = e.get("angle", 0) or 0
+        if abs(a) < 1e-9:
+            return (x, y, w, h)
+        c = (x + w / 2, y + h / 2)
+        pts = [rotate_about(p, c, a) for p in ((x, y), (x + w, y), (x + w, y + h), (x, y + h))]
+        x0 = min(p[0] for p in pts); y0 = min(p[1] for p in pts)
+        return (x0, y0, max(p[0] for p in pts) - x0, max(p[1] for p in pts) - y0)
+
+    texts_in = []
+    for e in els:
+        if e["type"] != "text" or not e.get("text", "").strip():
+            continue
+        font, upem, asc, desc = FONTS.get(e.get("fontFamily"), FONTS[1])
+        texts_in.append(dict(e, x=e["x"] + off[0], y=e["y"] + off[1], font=font, upem=upem, asc=asc, desc=desc))
+    texts = page.evaluate(JS_TEXT, texts_in)
+
+    images = [e for e in els if e["type"] == "image"]
+    svg_img = lambda e: files.get(e["fileId"], {}).get("mimeType") == "image/svg+xml"
+
+    # Notes: a rounded rectangle (solid) or the union of one group's bands (gradient).
+    notes, groups = [], {}
+    for e in els:
+        if e["type"] == "rectangle" and e.get("groupIds"):
+            groups.setdefault(e["groupIds"][0], []).append(bx(e))
+        elif e["type"] == "rectangle" and e.get("roundness"):
+            notes.append(bx(e))
+    for g in groups.values():
+        x0 = min(b[0] for b in g); y0 = min(b[1] for b in g)
+        x1 = max(b[0] + b[2] for b in g); y1 = max(b[1] + b[3] - 0.15 for b in g)   # minus the band overlap
+        notes.append((x0, y0, x1 - x0, y1 - y0))
+
+    linear = [e for e in els if e["type"] in ("line", "arrow") and not e.get("polygon")]
+    conns, arrows = [], []
+    for e in linear:
+        pts = [(e["x"] + off[0] + p[0], e["y"] + off[1] + p[1]) for p in e["points"]]
+        conns.append([pts[0], pts[-1]])
+        if e["type"] == "arrow":
+            if e.get("startArrowhead"): arrows.append((pts[0], pts[1], e["startArrowhead"]))
+            if e.get("endArrowhead"): arrows.append((pts[-1], pts[-2], e["endArrowhead"]))
+    return {
+        "texts": texts,
+        "stickers": [bx(e) for e in images if svg_img(e)],
+        "images": [bx(e) for e in images if not svg_img(e)],
+        "notes": notes,
+        "shapes": [outline(e, off) for e in els if is_shape(e)],
+        "connectors": conns,
+        "arrows": arrows,
+    }
+
+
+# ----------------------------------------------------------------------------------------
+# Comparisons
+# ----------------------------------------------------------------------------------------
+def seg_dist(p, a, b):
+    abx, aby = b[0] - a[0], b[1] - a[1]; L = abx * abx + aby * aby
+    t = 0 if L == 0 else max(0, min(1, ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / L))
+    return math.hypot(p[0] - a[0] - t * abx, p[1] - a[1] - t * aby)
+
+
+def poly_dist(p, poly):
+    return min(seg_dist(p, poly[i], poly[(i + 1) % len(poly)]) for i in range(len(poly)))
+
+
+def box_err(s, o):
+    """Largest edge error between two (x, y, w, h) boxes."""
+    return max(abs(s[0] - o[0]), abs(s[1] - o[1]), abs(s[0] + s[2] - o[0] - o[2]), abs(s[1] + s[3] - o[1] - o[3]))
+
+
+def nearest_boxes(src, out):
+    """Pairs every source box with the closest unused output box (by centre)."""
+    pool = list(out); errs = []
+    for s in src:
+        if not pool: break
+        c = (s[0] + s[2] / 2, s[1] + s[3] / 2)
+        j = min(range(len(pool)), key=lambda i: math.hypot(pool[i][0] + pool[i][2] / 2 - c[0], pool[i][1] + pool[i][3] / 2 - c[1]))
+        errs.append(box_err(s, pool.pop(j)))
+    return errs
+
+
+def compare(src: dict, out: dict) -> dict:
+    res = {}
+    # Texts: match by exact text, in order. Excalidraw drops bold and the font face, so line
+    # widths differ; x is compared at the alignment anchor (left edge, centre or right edge),
+    # y at the top of the glyph box. Rotated text is compared by the centre of its bounds.
+    pool = list(out["texts"]); rows = []
+    for s in src["texts"]:
+        j = next((i for i, o in enumerate(pool) if o["text"] == s["text"]), None)
+        if j is None:
+            rows.append({"text": s["text"][:50], "missing": True}); continue
+        o = pool.pop(j)
+        if abs(o["angle"]) > 1e-6:
+            dx = (o["x"] + o["w"] / 2) - (s["bx"] + s["bw"] / 2); dy = (o["y"] + o["h"] / 2) - (s["by"] + s["bh"] / 2)
+        else:
+            k = {"left": 0.0, "center": 0.5, "right": 1.0}.get(o["align"], 0.0)
+            dx = (o["x"] + k * o["w"]) - (s["bx"] + k * s["bw"]); dy = o["y"] - s["by"]
+        # Bottom-edge difference: shows line-spacing drift on multi-line text (informational --
+        # wrapping can legitimately differ because bold and the font face are dropped).
+        rows.append({"text": s["text"][:50], "dx": round(dx, 1), "dy": round(dy, 1), "err": round(math.hypot(dx, dy), 1),
+                     "dbottom": round((o["y"] + o["h"]) - (s["by"] + s["bh"]), 1)})
+    errs = [r["err"] for r in rows if "err" in r]
+    res["text"] = {"expected": len(src["texts"]), "matched": len(errs),
+                   "median": round(sorted(errs)[len(errs) // 2], 1) if errs else None,
+                   "max": max(errs) if errs else None, "rows": rows}
+    for k in ("sticker", "note", "image"):
+        e = nearest_boxes(src[k + "s"], out[k + "s"])
+        res[k] = {"expected": len(src[k + "s"]), "matched": len(out[k + "s"]), "max": round(max(e), 2) if e else None}
+    # Shapes: nearest output outline; max distance both ways between true and output outline.
+    sh = []; pool = list(out["shapes"])
+    for s in src["shapes"]:
+        if not pool: break
+        cx = sum(p[0] for p in s["pts"]) / len(s["pts"]); cy = sum(p[1] for p in s["pts"]) / len(s["pts"])
+        j = min(range(len(pool)), key=lambda i: math.hypot(sum(p[0] for p in pool[i]) / len(pool[i]) - cx,
+                                                            sum(p[1] for p in pool[i]) / len(pool[i]) - cy))
+        o = pool.pop(j)
+        d1 = max(poly_dist(p, o) for p in s["pts"]); d2 = max(poly_dist(p, s["pts"]) for p in o)
+        # Whiteboard draws an "oval" as 8 quadratic curves, which bulge up to ~0.33% of the
+        # radius off a true ellipse; the converter draws a real (editable) Excalidraw ellipse
+        # through the same extremes, so ovals may deviate by that much on top of the tolerance.
+        allow = TOL["shape"]
+        if s["label"].strip().lower() in ("oval", "ellipse", "circle"):
+            r = max(max(p[0] for p in s["pts"]) - min(p[0] for p in s["pts"]),
+                    max(p[1] for p in s["pts"]) - min(p[1] for p in s["pts"])) / 2
+            allow = max(allow, 0.0035 * r)
+        sh.append({"label": s["label"], "dev": round(max(d1, d2), 2), "allowed": round(allow, 2)})
+    res["shape"] = {"expected": len(src["shapes"]), "matched": len(out["shapes"]),
+                    "max": max((r["dev"] for r in sh), default=None),
+                    "over": sum(1 for r in sh if r["dev"] > r["allowed"]), "rows": sh}
+    # Connectors: both endpoints, in order.
+    ce = []
+    for s in src["connectors"]:
+        best = min((max(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(s, o)) for o in out["connectors"]), default=None)
+        if best is not None: ce.append(best)
+    res["connector"] = {"expected": len(src["connectors"]), "matched": len(out["connectors"]), "max": round(max(ce), 2) if ce else None}
+    # Arrowheads: the chevron's tip must be an arrowhead end, pointing the same way.
+    ae, angle_bad = [], 0
+    for s in src["arrows"]:
+        tip = s[1]; base = ((s[0][0] + s[2][0]) / 2, (s[0][1] + s[2][1]) / 2)
+        cands = [(math.hypot(o[0][0] - tip[0], o[0][1] - tip[1]), o) for o in out["arrows"]]
+        if not cands: continue
+        d, o = min(cands, key=lambda c: c[0]); ae.append(d)
+        want = math.atan2(tip[1] - base[1], tip[0] - base[0]); got = math.atan2(o[0][1] - o[1][1], o[0][0] - o[1][0])
+        if abs((math.degrees(want - got) + 180) % 360 - 180) > ARROW_ANGLE_TOL: angle_bad += 1
+    res["arrow"] = {"expected": len(src["arrows"]), "matched": len(out["arrows"]), "max": round(max(ae), 2) if ae else None,
+                    "wrong_direction": angle_bad}
+    fails = []
+    if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
+    if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
+    for k in ("sticker", "note", "image", "shape", "connector", "arrow"):
+        if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
+        if k == "shape":
+            if res[k]["over"]: fails.append(f"{res[k]['over']} shape(s) off by up to {res[k]['max']} px")
+        elif res[k]["max"] is not None and res[k]["max"] > TOL[k]: fails.append(f"{k} off by {res[k]['max']} px")
+    if angle_bad: fails.append(f"{angle_bad} arrowhead(s) point the wrong way")
+    res["fails"] = fails
+    return res
+
+
+# ----------------------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scripts", type=Path, default=REPO, help="folder with the converter scripts")
+    ap.add_argument("--samples", type=Path, default=REPO / "samples")
+    ap.add_argument("--out", type=Path, default=REPO / "tests" / "out" / "visual")
+    ap.add_argument("--sample", nargs="*", help="only these sample folder names")
+    ap.add_argument("--version", nargs="*", choices=VERSIONS, default=list(VERSIONS))
+    ap.add_argument("--powershell", help="PowerShell executable (default: powershell.exe on Windows, else pwsh)")
+    a = ap.parse_args()
+
+    ps = find_powershell(a.powershell)
+    a.out.mkdir(parents=True, exist_ok=True)
+    samples = sorted(d for d in a.samples.iterdir() if d.is_dir() and (not a.sample or d.name in a.sample))
+    scripts = {v: instrument(a.scripts / f"Convert-WhiteboardHtmlToExcalidraw-{v}.ps1",
+                             a.out / "_instrumented" / f"Convert-WhiteboardHtmlToExcalidraw-{v}.ps1") for v in a.version}
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        hpage = browser.new_page(viewport={"width": 1600, "height": 1000}, device_scale_factor=2)
+        tpage = browser.new_page()
+        for d in samples:
+            html = next(d.glob("*.html"), None)
+            if not html: continue
+            try:
+                src = measure_html(hpage, html)
+            except Exception as e:
+                results.append({"board": d.name, "version": "-", "status": "ERROR", "fails": [f"HTML: {e}"]}); continue
+            for v, script in scripts.items():
+                r = {"board": d.name, "version": v}
+                scene, off, log = convert(ps, script, html, a.out / "scenes" / v)
+                if not scene:
+                    r.update(status="FAIL", fails=["conversion failed: " + log[-300:].replace("\n", " ")])
+                else:
+                    try:
+                        r["checks"] = compare(src, measure_scene(tpage, scene, off))
+                        r["fails"] = r["checks"].pop("fails")
+                        r["status"] = "FAIL" if r["fails"] else "PASS"
+                    except Exception as e:
+                        r.update(status="ERROR", fails=[repr(e)])
+                results.append(r)
+                c = r.get("checks", {})
+                m = lambda k: c.get(k, {}).get("max")
+                print(f"{d.name:24} {v:9} {r['status']:5}  text {m('text')}  sticker {m('sticker')}  note {m('note')}  "
+                      f"image {m('image')}  shape {m('shape')}  connector {m('connector')}  arrow {m('arrow')}  "
+                      f"{'; '.join(r.get('fails', []))}", flush=True)
+        browser.close()
+    (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+    bad = [r for r in results if r["status"] != "PASS"]
+    print(f"\n{len(results)} check(s): {len(results) - len(bad)} passed, {len(bad)} failed. "
+          f"Tolerances (board px): {TOL}. Details: {a.out / 'results.json'}")
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()
