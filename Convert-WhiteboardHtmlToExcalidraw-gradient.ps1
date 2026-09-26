@@ -6,17 +6,19 @@ Converts a Microsoft Whiteboard HTML export into an editable Excalidraw scene (v
 .DESCRIPTION
 Reads the self-contained HTML produced by Export-WhiteboardHtml and translates
 the board objects exposed in that document into Excalidraw JSON. The converter
-currently handles shapes, plain text, sticky notes, connectors, and embedded
-images. Reaction stickers are translated to native Excalidraw vectors/text so
-that they remain visible when Excalidraw rejects Microsoft embedded SVG data.
+currently handles shapes, plain text, sticky notes, connectors (with their
+arrowheads), reaction stickers and embedded images. Stickers embed Whiteboard's
+own SVG artwork. Shapes are traced from their outline path: rectangles, ovals and
+diamonds become native Excalidraw shapes sized to that outline, anything else a
+closed polygon. Rotated objects keep their rotation (Excalidraw's element angle).
 Shape-contained text is emitted as a separate editable text element.
 Whiteboard linear-gradient note backgrounds are approximated with grouped,
 editable Excalidraw color bands because Excalidraw has no native gradient fill.
 
 The HTML export is a rendered representation, not Microsoft's native board
 schema. Consequently, CSS-only texture/gradient effects are reduced to solid
-colors and complex SVG paths are represented by their bounding box unless they
-are embedded images.
+colors. Anything drawn approximately (mirrored objects drawn unmirrored, stickers
+without artwork, shapes built from their label) is reported in the run summary.
 
 .EXAMPLE
 .\Convert-WhiteboardHtmlToExcalidraw-v3.ps1 -InputPath .\Templateboard.html
@@ -51,6 +53,26 @@ param(
 begin {
     Set-StrictMode -Version 2.0
     $ErrorActionPreference = 'Stop'
+
+    # Whiteboard plain-text inset (pre-scale px): ".textbox.plainText > div { padding: 16px; }"
+    # in the export's stylesheet, plus Draft.js's 1px left caret gutter. The anchor's matrix
+    # translateY (-16 x scale) cancels the top padding, so glyphs start at (left + 17*s, top).
+    $PlainTextInsetLeft  = 17
+    $PlainTextInsetRight = 16
+    $PlainTextInsetTop   = 16
+
+    # Excalidraw lays text out with its own font metrics: for fontFamily 2 (Helvetica, drawn
+    # with Arial on Windows) the first baseline sits at y + ((lineHeight - 1) / 2 + 1577/2048)
+    # * fontSize. Whiteboard's "sans-serif" is Arial at line-height normal (1.15 x font
+    # size), with the baseline 1854/2048 x font size below the line top. Using Excalidraw's
+    # own Helvetica line height (1.15) and moving each text down by the difference puts the
+    # first baseline -- and every later line -- where Whiteboard draws it.
+    $TextLineHeight    = 1.15
+    $TextBaselineShift = (1854 / 2048) - ((($TextLineHeight - 1) / 2) + (1577 / 2048))
+
+    # ".stickyNote { border-width: 1px }" sits outside the note's CSS width/height, and the
+    # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
+    $NoteBorder = 1
 
     function Get-FirstMatch {
         param([string]$Text, [string]$Pattern, [int]$Group = 1)
@@ -129,22 +151,26 @@ begin {
     }
 
     function Add-GradientRectangle {
+        # Draws the note as $Steps grouped colour bands. The box is given in the anchor's
+        # local px, and each band is placed (and rotated) through the anchor's matrix.
         param(
-            [Collections.Generic.List[object]]$Elements,
-            [double]$X, [double]$Y, [double]$Width, [double]$Height,
+            [Collections.Generic.List[object]]$Elements, $Anchor,
+            [double]$LocalWidth, [double]$LocalHeight,
             [int[]]$StartColor, [int[]]$EndColor, [int]$Steps
         )
         $groupId = New-Id
-        $bandHeight = [double]$Height / [double]$Steps
+        $bandHeight = [double]$LocalHeight / [double]$Steps
+        # A small overlap prevents hairline gaps at fractional zoom levels (0.15 board px).
+        $overlap = 0.15 / $Anchor.ScaleY
         for ($i = 0; $i -lt $Steps; $i++) {
             $ratio = if ($Steps -le 1) { 0.0 } else { [double]$i / [double]($Steps - 1) }
             $red = [Math]::Round($StartColor[0] + (($EndColor[0] - $StartColor[0]) * $ratio))
             $green = [Math]::Round($StartColor[1] + (($EndColor[1] - $StartColor[1]) * $ratio))
             $blue = [Math]::Round($StartColor[2] + (($EndColor[2] - $StartColor[2]) * $ratio))
             $color = '#{0:x2}{1:x2}{2:x2}' -f [int]$red, [int]$green, [int]$blue
-            # A small overlap prevents hairline gaps at fractional zoom levels.
-            $bandY = $Y + ($i * $bandHeight)
-            $band = New-BaseElement 'rectangle' $X $bandY $Width ($bandHeight + 0.15) 'transparent' $color 'solid' 1
+            $p = Get-BoxPlacement $Anchor 0 ($i * $bandHeight) $LocalWidth ($bandHeight + $overlap)
+            $band = New-BaseElement 'rectangle' $p.X $p.Y $p.Width $p.Height 'transparent' $color 'solid' 1
+            $band.angle = $p.Angle
             $band.groupIds = @($groupId)
             [void]$Elements.Add([pscustomobject]$band)
         }
@@ -187,14 +213,27 @@ begin {
     }
 
     function Get-Transform {
+        # Reads a CSS matrix(a, b, c, d, e, f). The scale is the length of each column
+        # (sqrt(a^2+b^2), sqrt(c^2+d^2)) rather than |a| and |d|: those are only the scale
+        # when there is no rotation -- a 90-degree-rotated object has a = d = 0, which used
+        # to give it a zero font size and crash the text-height estimate with Infinity.
+        # The raw matrix is kept so rotated objects can be placed and rotated correctly.
         param([string]$Style)
-        $result = @{ ScaleX = 1.0; ScaleY = 1.0; TranslateX = 0.0; TranslateY = 0.0 }
+        $result = @{ ScaleX = 1.0; ScaleY = 1.0; TranslateX = 0.0; TranslateY = 0.0
+                     A = 1.0; B = 0.0; C = 0.0; D = 1.0; IsRotated = $false; IsMirrored = $false }
         $matrix = Get-FirstMatch $Style 'transform\s*:\s*matrix\(([^)]+)\)'
         if ($matrix) {
             $v = @($matrix -split '\s*,\s*' | ForEach-Object { Get-Number $_ })
             if ($v.Count -ge 6) {
-                $result.ScaleX = [Math]::Abs($v[0]); $result.ScaleY = [Math]::Abs($v[3])
+                $sx = [Math]::Sqrt(($v[0] * $v[0]) + ($v[1] * $v[1]))
+                $sy = [Math]::Sqrt(($v[2] * $v[2]) + ($v[3] * $v[3]))
+                if ($sx -gt 0) { $result.ScaleX = $sx }
+                if ($sy -gt 0) { $result.ScaleY = $sy }
+                $result.A = $v[0]; $result.B = $v[1]; $result.C = $v[2]; $result.D = $v[3]
                 $result.TranslateX = $v[4]; $result.TranslateY = $v[5]
+                $result.IsRotated = ([Math]::Abs($v[1]) -gt 1e-6 -or [Math]::Abs($v[2]) -gt 1e-6 -or $v[0] -lt 0 -or $v[3] -lt 0)
+                # A negative determinant is a mirror image, which Excalidraw can't show.
+                $result.IsMirrored = ((($v[0] * $v[3]) - ($v[1] * $v[2])) -lt 0)
             }
         }
         return $result
@@ -214,7 +253,33 @@ begin {
             ScaleX = Get-ScalarDouble $transform.ScaleX 1
             ScaleY = Get-ScalarDouble $transform.ScaleY 1
             IsCentered = ($class -match '\balign\s+center\b')
+            # Raw CSS matrix terms (a, b, c, d); identity when there is no transform.
+            MA = $transform.A; MB = $transform.B; MC = $transform.C; MD = $transform.D
+            IsRotated = $transform.IsRotated; IsMirrored = $transform.IsMirrored
         }
+    }
+
+    function Get-BoardPoint {
+        # Maps a point in the anchor's local (pre-transform) px to board coordinates.
+        param($Anchor, [double]$U, [double]$V)
+        return ,([double[]]@(($Anchor.X + ($Anchor.MA * $U) + ($Anchor.MC * $V)),
+                             ($Anchor.Y + ($Anchor.MB * $U) + ($Anchor.MD * $V))))
+    }
+
+    function Get-BoxPlacement {
+        # Places a box given in the anchor's local px (U, V = top-left, unrotated). Excalidraw
+        # rotates an element about its centre by "angle" (radians, clockwise), so the box
+        # centre goes through the anchor's matrix and the scaled box is laid around it.
+        # Without rotation this reduces to (X + U*s, Y + V*s).
+        param($Anchor, [double]$U, [double]$V, [double]$LocalWidth, [double]$LocalHeight)
+        $c = Get-BoardPoint $Anchor ($U + ($LocalWidth / 2)) ($V + ($LocalHeight / 2))
+        $w = $LocalWidth * $Anchor.ScaleX; $h = $LocalHeight * $Anchor.ScaleY
+        $angle = 0.0
+        if ($Anchor.IsRotated) {
+            $angle = [Math]::Atan2($Anchor.MB, $Anchor.MA)
+            if ($angle -lt 0) { $angle += 2 * [Math]::PI }
+        }
+        return [pscustomobject]@{ X = ($c[0] - ($w / 2)); Y = ($c[1] - ($h / 2)); Width = $w; Height = $h; Angle = $angle }
     }
 
     function Get-ImageSize {
@@ -303,13 +368,13 @@ begin {
             [Collections.Generic.List[object]]$Elements, [string]$Text,
             [double]$X, [double]$Y, [double]$Width, [double]$Height,
             [double]$FontSize, [string]$Color, [string]$Align = 'left',
-            [switch]$Bold
+            [double]$Angle = 0
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
         $Width = Get-ScalarDouble $Width 1; $Height = Get-ScalarDouble $Height 1
         $FontSize = Get-ScalarDouble $FontSize 20
-        $lineHeight = 1.25
+        $lineHeight = $TextLineHeight
         $fontFamily = 2 # Helvetica/sans-serif in Excalidraw
         $estimatedWidth = [Math]::Max(1, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
         if ($Width -le 1) { $Width = $estimatedWidth }
@@ -322,7 +387,7 @@ begin {
         $e.fontSize = $FontSize; $e.fontFamily = $fontFamily
         $e.text = $Text; $e.rawText = $Text; $e.originalText = $Text
         $e.textAlign = $Align; $e.verticalAlign = 'top'; $e.containerId = $null
-        $e.autoResize = $false; $e.lineHeight = $lineHeight
+        $e.autoResize = $false; $e.lineHeight = $lineHeight; $e.angle = $Angle
         [void]$Elements.Add([pscustomobject]$e)
     }
 
@@ -372,9 +437,208 @@ begin {
             return
         }
 
-        $symbol = if ($Label -match 'star') { [char]0x2605 } elseif ($Label -match 'trophy') { [char]::ConvertFromUtf32(0x1F3C6) } else { '?' }
-        $color = if ($Label -match 'star') { '#f5b700' } elseif ($Label -match 'trophy') { '#636363' } else { '#1f1f1f' }
+        # Fallback only (used when a sticker has no embedded artwork): best-effort glyph.
+        $symbol = if ($Label -match 'star') { [char]0x2605 }
+                  elseif ($Label -match 'trophy') { [char]::ConvertFromUtf32(0x1F3C6) }
+                  elseif ($Label -match 'heart') { [char]0x2764 }
+                  elseif ($Label -match 'fire') { [char]::ConvertFromUtf32(0x1F525) }
+                  elseif ($Label -match 'like|thumb') { [char]::ConvertFromUtf32(0x1F44D) }
+                  elseif ($Label -match 'light ?bulb|idea') { [char]::ConvertFromUtf32(0x1F4A1) }
+                  else { [char]0x25CF }
+        $color = if ($Label -match 'star') { '#f5b700' } elseif ($Label -match 'trophy') { '#636363' }
+                 elseif ($Label -match 'heart') { '#e8336d' } elseif ($Label -match 'fire') { '#f26b1d' }
+                 elseif ($Label -match 'like|thumb') { '#f2b400' } else { '#1f1f1f' }
         Add-TextElement $Elements ([string]$symbol) $X $Y $size $size ($size * 0.9) $color 'center'
+    }
+
+    function Get-ShapePathPoints {
+        # Traces the shape's own outline from Whiteboard's SVG <path d="..."> (the first,
+        # visible path inside the shape's <g>), flattening curves into points, and maps it
+        # with (X, Y) + point * scale. This keeps the true geometry of ovals, triangles etc.
+        # instead of guessing it from the aria-label. Returns $null (so the caller falls back
+        # to the label) when the path uses something not handled here: arcs (A), smooth
+        # shorthands (S/T), more than one subpath, or a <g> transform other than a translate.
+        param([string]$Block, [double]$X, [double]$Y, [double]$ScaleX, [double]$ScaleY, [int]$CurveSegments = 8)
+        $opts = [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Singleline
+        $m = [regex]::Match($Block, '<svg\b[^>]*\bclass="[^"]*\bshape\b[^"]*"[^>]*>\s*(<g\b[^>]*>)\s*<path\b[^>]*?\sd="([^"]+)"', $opts)
+        if (-not $m.Success) { return $null }
+        $gTag = $m.Groups[1].Value; $d = $m.Groups[2].Value
+        $tx = 0.0; $ty = 0.0
+        $gTransform = Get-FirstMatch $gTag '\btransform="([^"]*)"'
+        if ($gTransform) {
+            $t = [regex]::Match($gTransform, '^\s*translate\(\s*([-+0-9.eE]+)(?:[\s,]+([-+0-9.eE]+))?\s*\)\s*$')
+            if (-not $t.Success) { return $null }
+            $tx = Get-Number $t.Groups[1].Value 0
+            if ($t.Groups[2].Success) { $ty = Get-Number $t.Groups[2].Value 0 }
+        }
+        $tokens = @([regex]::Matches($d, '[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?') | ForEach-Object { $_.Value })
+        $pts = New-Object Collections.Generic.List[double[]]
+        $i = 0; $cmd = ''; $cx = 0.0; $cy = 0.0; $sx = 0.0; $sy = 0.0; $subpaths = 0
+        $isNum = { param($tok) $tok -notmatch '^[A-Za-z]$' }
+        while ($i -lt $tokens.Count) {
+            if (-not (& $isNum $tokens[$i])) { $cmd = $tokens[$i]; $i++ }
+            elseif (-not $cmd) { return $null }
+            $rel = ($cmd -ceq $cmd.ToLowerInvariant())
+            $ox = if ($rel) { $cx } else { 0.0 }; $oy = if ($rel) { $cy } else { 0.0 }
+            switch -CaseSensitive ($cmd.ToUpperInvariant()) {
+                'M' {
+                    if ($i + 1 -ge $tokens.Count) { return $null }
+                    $subpaths++
+                    if ($subpaths -gt 1) { return $null }
+                    $cx = $ox + (Get-Number $tokens[$i] 0); $cy = $oy + (Get-Number $tokens[$i + 1] 0); $i += 2
+                    $sx = $cx; $sy = $cy
+                    [void]$pts.Add([double[]]@($cx, $cy))
+                    $cmd = if ($rel) { 'l' } else { 'L' }   # extra pairs after M are line-tos
+                }
+                'L' {
+                    if ($i + 1 -ge $tokens.Count) { return $null }
+                    $cx = $ox + (Get-Number $tokens[$i] 0); $cy = $oy + (Get-Number $tokens[$i + 1] 0); $i += 2
+                    [void]$pts.Add([double[]]@($cx, $cy))
+                }
+                'H' { $cx = $ox + (Get-Number $tokens[$i] 0); $i += 1; [void]$pts.Add([double[]]@($cx, $cy)) }
+                'V' { $cy = $oy + (Get-Number $tokens[$i] 0); $i += 1; [void]$pts.Add([double[]]@($cx, $cy)) }
+                'Q' {
+                    if ($i + 3 -ge $tokens.Count) { return $null }
+                    $x1 = $ox + (Get-Number $tokens[$i] 0);     $y1 = $oy + (Get-Number $tokens[$i + 1] 0)
+                    $x2 = $ox + (Get-Number $tokens[$i + 2] 0); $y2 = $oy + (Get-Number $tokens[$i + 3] 0); $i += 4
+                    for ($s = 1; $s -le $CurveSegments; $s++) {
+                        $u = $s / $CurveSegments; $v = 1 - $u
+                        [void]$pts.Add([double[]]@((($v * $v * $cx) + (2 * $v * $u * $x1) + ($u * $u * $x2)),
+                                                   (($v * $v * $cy) + (2 * $v * $u * $y1) + ($u * $u * $y2))))
+                    }
+                    $cx = $x2; $cy = $y2
+                }
+                'C' {
+                    if ($i + 5 -ge $tokens.Count) { return $null }
+                    $x1 = $ox + (Get-Number $tokens[$i] 0);     $y1 = $oy + (Get-Number $tokens[$i + 1] 0)
+                    $x2 = $ox + (Get-Number $tokens[$i + 2] 0); $y2 = $oy + (Get-Number $tokens[$i + 3] 0)
+                    $x3 = $ox + (Get-Number $tokens[$i + 4] 0); $y3 = $oy + (Get-Number $tokens[$i + 5] 0); $i += 6
+                    for ($s = 1; $s -le $CurveSegments; $s++) {
+                        $u = $s / $CurveSegments; $v = 1 - $u
+                        [void]$pts.Add([double[]]@((($v * $v * $v * $cx) + (3 * $v * $v * $u * $x1) + (3 * $v * $u * $u * $x2) + ($u * $u * $u * $x3)),
+                                                   (($v * $v * $v * $cy) + (3 * $v * $v * $u * $y1) + (3 * $v * $u * $u * $y2) + ($u * $u * $u * $y3))))
+                    }
+                    $cx = $x3; $cy = $y3
+                }
+                'Z' { $cx = $sx; $cy = $sy; $cmd = '' }
+                default { return $null }   # A, S, T and anything unexpected -> label fallback
+            }
+        }
+        if ($pts.Count -ge 2) {   # drop the closing duplicate; callers close the outline themselves
+            $first = $pts[0]; $last = $pts[$pts.Count - 1]
+            if ([Math]::Abs($first[0] - $last[0]) -lt 0.01 -and [Math]::Abs($first[1] - $last[1]) -lt 0.01) { $pts.RemoveAt($pts.Count - 1) }
+        }
+        if ($pts.Count -lt 3) { return $null }
+        $mapped = New-Object Collections.Generic.List[double[]]
+        foreach ($p in $pts) {
+            [void]$mapped.Add([double[]]@(($X + (($p[0] + $tx) * $ScaleX)), ($Y + (($p[1] + $ty) * $ScaleY))))
+        }
+        return ,($mapped.ToArray())
+    }
+
+    function Get-RasterImageDimensions {
+        # Native size of an embedded image, read from the file header (PNG, GIF, BMP, JPEG)
+        # or from an SVG's root width/height (else its viewBox). Used to size reaction
+        # stickers, whose <img> is shrunk by CSS max-width/max-height but never enlarged.
+        param([byte[]]$Bytes)
+        if ($Bytes.Length -ge 24 -and $Bytes[0] -eq 0x89 -and $Bytes[1] -eq 0x50 -and $Bytes[2] -eq 0x4e -and $Bytes[3] -eq 0x47) {
+            # PNG: width/height are big-endian Int32 at offset 16 / 20 (the IHDR chunk).
+            $w = ([int]$Bytes[16] -shl 24) -bor ([int]$Bytes[17] -shl 16) -bor ([int]$Bytes[18] -shl 8) -bor [int]$Bytes[19]
+            $h = ([int]$Bytes[20] -shl 24) -bor ([int]$Bytes[21] -shl 16) -bor ([int]$Bytes[22] -shl 8) -bor [int]$Bytes[23]
+            if ($w -gt 0 -and $h -gt 0) { return [pscustomobject]@{ Width = $w; Height = $h } }
+        }
+        elseif ($Bytes.Length -ge 10 -and $Bytes[0] -eq 0x47 -and $Bytes[1] -eq 0x49 -and $Bytes[2] -eq 0x46) {
+            # GIF: width/height are little-endian UInt16 at offset 6 / 8.
+            $w = [int]$Bytes[6] -bor ([int]$Bytes[7] -shl 8)
+            $h = [int]$Bytes[8] -bor ([int]$Bytes[9] -shl 8)
+            if ($w -gt 0 -and $h -gt 0) { return [pscustomobject]@{ Width = $w; Height = $h } }
+        }
+        elseif ($Bytes.Length -ge 26 -and $Bytes[0] -eq 0x42 -and $Bytes[1] -eq 0x4d) {
+            # BMP: width/height are little-endian Int32 at offset 18 / 22 (height may be
+            # negative for a top-down bitmap -- the magnitude is still the pixel count).
+            $w = [BitConverter]::ToInt32($Bytes, 18)
+            $h = [BitConverter]::ToInt32($Bytes, 22)
+            if ($w -gt 0 -and $h -ne 0) { return [pscustomobject]@{ Width = $w; Height = [Math]::Abs($h) } }
+        }
+        elseif ($Bytes.Length -ge 4 -and $Bytes[0] -eq 0xff -and $Bytes[1] -eq 0xd8) {
+            # JPEG: scan markers for the first SOFn segment (0xC0-0xCF, excluding the
+            # DHT/JPG/DAC marker numbers 0xC4/0xC8/0xCC) -- its payload holds height
+            # then width as big-endian UInt16, 3 bytes in.
+            $i = 2
+            while ($i -lt $Bytes.Length - 9) {
+                if ($Bytes[$i] -ne 0xff) { $i++; continue }
+                $marker = $Bytes[$i + 1]
+                if ($marker -eq 0xd8 -or $marker -eq 0x01 -or ($marker -ge 0xd0 -and $marker -le 0xd7)) { $i += 2; continue }
+                if ($i + 3 -ge $Bytes.Length) { break }
+                $segLen = ([int]$Bytes[$i + 2] -shl 8) -bor [int]$Bytes[$i + 3]
+                if ($marker -ge 0xc0 -and $marker -le 0xcf -and $marker -ne 0xc4 -and $marker -ne 0xc8 -and $marker -ne 0xcc) {
+                    if ($i + 9 -lt $Bytes.Length) {
+                        $h = ([int]$Bytes[$i + 5] -shl 8) -bor [int]$Bytes[$i + 6]
+                        $w = ([int]$Bytes[$i + 7] -shl 8) -bor [int]$Bytes[$i + 8]
+                        if ($w -gt 0 -and $h -gt 0) { return [pscustomobject]@{ Width = $w; Height = $h } }
+                    }
+                    break
+                }
+                if ($marker -eq 0xd9 -or $segLen -le 0) { break }
+                $i += 2 + $segLen
+            }
+        }
+
+        # SVG: the root width/height (plain user units / px only), else the viewBox size.
+        $headLength = [Math]::Min($Bytes.Length, 8192)
+        if ($headLength -gt 0) {
+            $head = [Text.Encoding]::UTF8.GetString($Bytes, 0, $headLength)
+            $svgTag = [regex]::Match($head, '<svg\b[^>]*>',
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+                [Text.RegularExpressions.RegexOptions]::Singleline)
+            if ($svgTag.Success) {
+                $tag = $svgTag.Value
+                $svgW = 0.0; $svgH = 0.0; $vbW = 0.0; $vbH = 0.0
+                $wm = [regex]::Match($tag, '\swidth\s*=\s*["'']\s*([0-9.]+)\s*(px)?\s*["'']', 'IgnoreCase')
+                $hm = [regex]::Match($tag, '\sheight\s*=\s*["'']\s*([0-9.]+)\s*(px)?\s*["'']', 'IgnoreCase')
+                if ($wm.Success) { $svgW = Get-Number $wm.Groups[1].Value 0 }
+                if ($hm.Success) { $svgH = Get-Number $hm.Groups[1].Value 0 }
+                $vb = [regex]::Match($tag, '\sviewBox\s*=\s*["'']([^"'']+)["'']', 'IgnoreCase')
+                if ($vb.Success) {
+                    $parts = @($vb.Groups[1].Value.Trim() -split '[\s,]+')
+                    if ($parts.Count -eq 4) { $vbW = Get-Number $parts[2] 0; $vbH = Get-Number $parts[3] 0 }
+                }
+                if ($svgW -le 0 -and $svgH -gt 0 -and $vbW -gt 0 -and $vbH -gt 0) { $svgW = $svgH * $vbW / $vbH }
+                if ($svgH -le 0 -and $svgW -gt 0 -and $vbW -gt 0 -and $vbH -gt 0) { $svgH = $svgW * $vbH / $vbW }
+                if ($svgW -le 0 -or $svgH -le 0) { $svgW = $vbW; $svgH = $vbH }
+                if ($svgW -gt 0 -and $svgH -gt 0) { return [pscustomobject]@{ Width = $svgW; Height = $svgH } }
+            }
+        }
+        return $null
+    }
+
+    function Get-EmbeddedImageData {
+        # Decodes the first <img src="data:..."> in an anchor block into raw bytes plus a MIME
+        # type Excalidraw accepts. Handles both base64 and URL-encoded (plain text) data URIs,
+        # and sniffs the real format when the declared MIME type is a placeholder such as
+        # image/* . Returns $null when there is no usable inline image.
+        param([string]$Block)
+        $src = Get-FirstMatch $Block '<img\b[^>]*\bsrc="([^"]+)"'
+        if (-not $src) { return $null }
+        $src = [Net.WebUtility]::HtmlDecode($src)
+        $m = [regex]::Match($src, '^data:([^;,]*)((?:;[^,]*)?),(.*)$',
+            [Text.RegularExpressions.RegexOptions]::Singleline)
+        if (-not $m.Success) { return $null }
+        $mime = $m.Groups[1].Value.ToLowerInvariant()
+        $isBase64 = $m.Groups[2].Value -match ';\s*base64'
+        $data = $m.Groups[3].Value
+        try {
+            if ($isBase64) { $bytes = [Convert]::FromBase64String($data) }
+            else { $bytes = [Text.Encoding]::UTF8.GetBytes([Uri]::UnescapeDataString($data)) }
+        } catch { return $null }
+        if ($null -eq $bytes -or $bytes.Length -eq 0) { return $null }
+        if ($mime -ne 'image/svg+xml' -and $mime -notmatch '^image/(png|jpe?g|gif|bmp|webp)$') {
+            $head = [Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min($bytes.Length, 1024))
+            if ($head -match '<svg\b') { $mime = 'image/svg+xml' }
+            else { $mime = Get-ImageMimeType ([Convert]::ToBase64String($bytes, 0, [Math]::Min($bytes.Length, 48))) }
+        }
+        if ($mime -eq 'image/jpg') { $mime = 'image/jpeg' }
+        return [pscustomobject]@{ Bytes = $bytes; Mime = $mime }
     }
 
     function Convert-OneFile {
@@ -400,29 +664,75 @@ begin {
         $imageFilesWritten = [Collections.Generic.List[string]]::new()
         $destBaseName = [IO.Path]::GetFileNameWithoutExtension($DestinationPath)
         $imageOutputDir = Join-Path (Split-Path -Parent $DestinationPath) "${destBaseName}_images"
+        $stickerImageCount = 0; $stickerFallbackCount = 0
+        $shapeTracedCount = 0; $shapeFallbackCount = 0
+        $rotatedCount = 0; $mirrorIgnored = [Collections.Generic.List[string]]::new()
+        $arrowheadCount = 0
 
         foreach ($block in $blocks) {
             $a = Get-AnchorInfo $block
             if (-not $a.Type) { continue }
             if (-not $sourceTypes.ContainsKey($a.Type)) { $sourceTypes[$a.Type] = 0 }
             $sourceTypes[$a.Type]++
+            # Excalidraw rotates any element (its "angle"), but can't mirror one: a mirrored
+            # object is drawn with the right rotation and size but unmirrored.
+            if ($a.IsRotated) { $rotatedCount++ }
+            if ($a.IsMirrored) { [void]$mirrorIgnored.Add("$($a.Type):$($a.Key)") }
 
             switch ($a.Type) {
                 'Shape' {
                     $svgTag = Get-FirstMatch $block '(<svg\b[^>]*\bclass="[^"]*\bshape\b[^"]*"[^>]*>)'
                     if (-not $svgTag) { $svgTag = Get-FirstMatch $block '(<svg\b[^>]*>)' }
-                    $w = (Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') 100) * $a.ScaleX
-                    $h = (Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') 100) * $a.ScaleY
+                    # Everything below is in the anchor's local (pre-transform) px; the anchor's
+                    # matrix is applied by Get-BoxPlacement / Get-BoardPoint.
+                    $lw = Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') 100
+                    $lh = Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') 100
+                    $u0 = 0.0; $v0 = 0.0
+                    if ($a.IsCentered) { $u0 = -$lw / 2; $v0 = -$lh / 2 }
                     $gTag = Get-FirstMatch $block '(<g\b[^>]*>)'
                     $fill = Convert-RgbaToHex (Get-FirstMatch $gTag '\bfill="([^"]+)"') '#ffffff' -TransparentAllowed
                     $stroke = Convert-RgbaToHex (Get-FirstMatch $gTag '\bstroke="([^"]+)"') '#1f1f1f' -TransparentAllowed
                     $dash = Get-FirstMatch $gTag '\bstroke-dasharray="([^"]+)"'
                     $strokeStyle = if ($dash) { 'dashed' } else { 'solid' }
-                    $x = $a.X; $y = $a.Y
-                    if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
                     $shapeName = Get-FirstMatch $svgTag 'aria-label="\s*([^,."]+)'
-                    $kind = if ($shapeName -match 'ellipse|circle') { 'ellipse' } elseif ($shapeName -match 'diamond') { 'diamond' } else { 'rectangle' }
-                    $e = New-BaseElement $kind $x $y $w $h $stroke $fill $strokeStyle 2
+                    # Whiteboard labels circles/ellipses "oval" -- previously unmatched here,
+                    # which turned every oval into a rectangle.
+                    $kind = if ($shapeName -match 'ellipse|circle|oval') { 'ellipse' }
+                            elseif ($shapeName -match 'diamond') { 'diamond' }
+                            elseif ($shapeName -match 'rectangle|square') { 'rectangle' }
+                            else { $null }
+                    # Prefer Whiteboard's own outline path: its bounds are the shape's true
+                    # geometry (the <svg> box also includes the stroke), and shapes Excalidraw
+                    # has no primitive for are drawn from it as a closed polygon.
+                    $outline = Get-ShapePathPoints $block $u0 $v0 1 1
+                    if ($null -ne $outline) {
+                        $shapeTracedCount++
+                        $xs = @($outline | ForEach-Object { $_[0] }); $ys = @($outline | ForEach-Object { $_[1] })
+                        $bu = ($xs | Measure-Object -Minimum -Maximum); $bv = ($ys | Measure-Object -Minimum -Maximum)
+                        $boxU = $bu.Minimum; $boxV = $bv.Minimum
+                        $boxW = $bu.Maximum - $bu.Minimum; $boxH = $bv.Maximum - $bv.Minimum
+                    } else {
+                        $shapeFallbackCount++
+                        $boxU = $u0; $boxV = $v0; $boxW = $lw; $boxH = $lh
+                        if (-not $kind) { $kind = 'rectangle' }
+                    }
+                    if ($kind) {
+                        $p = Get-BoxPlacement $a $boxU $boxV $boxW $boxH
+                        $e = New-BaseElement $kind $p.X $p.Y $p.Width $p.Height $stroke $fill $strokeStyle 2
+                        $e.angle = $p.Angle
+                    } else {
+                        # Closed polygon through the traced outline, mapped through the full matrix.
+                        $board = @($outline | ForEach-Object { Get-BoardPoint $a $_[0] $_[1] })
+                        $x0 = $board[0][0]; $y0 = $board[0][1]
+                        $pointList = New-Object Collections.ArrayList
+                        foreach ($bp in $board) { [void]$pointList.Add([double[]]@(($bp[0] - $x0), ($bp[1] - $y0))) }
+                        [void]$pointList.Add([double[]]@(0, 0))
+                        $pxs = @($board | ForEach-Object { $_[0] }); $pys = @($board | ForEach-Object { $_[1] })
+                        $pw = ($pxs | Measure-Object -Minimum -Maximum); $ph = ($pys | Measure-Object -Minimum -Maximum)
+                        $e = New-BaseElement 'line' $x0 $y0 ($pw.Maximum - $pw.Minimum) ($ph.Maximum - $ph.Minimum) $stroke $fill $strokeStyle 2
+                        $e.points = $pointList; $e.polygon = $true; $e.lastCommittedPoint = $null
+                        $e.startBinding = $null; $e.endBinding = $null; $e.startArrowhead = $null; $e.endArrowhead = $null
+                    }
                     [void]$elements.Add([pscustomobject]$e)
 
                     # Whiteboard stores labels such as the blue-box "test" text
@@ -431,15 +741,14 @@ begin {
                     if (-not [string]::IsNullOrEmpty($shapeText)) {
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
-                        $font = (Get-CssNumber $shapeTextStyle 'font-size' 20) * $a.ScaleY
-                        $innerWidth = (Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $w - 26))) * $a.ScaleX
-                        $innerHeight = (Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $h - 26))) * $a.ScaleY
-                        $textHeight = [Math]::Min($innerHeight, $font * 1.25)
-                        $textX = $x + (($w - $innerWidth) / 2)
-                        $textY = $y + (($h - $textHeight) / 2)
+                        $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
+                        $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $lw - 26))
+                        $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $lh - 26))
+                        $textHeight = [Math]::Min($innerHeight, $fontLocal * $TextLineHeight)
+                        $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2)) $innerWidth $textHeight
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
-                        Add-TextElement $elements $shapeText $textX $textY $innerWidth $textHeight $font $textColor $textAlign
+                        Add-TextElement $elements $shapeText $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $textColor $textAlign $p.Angle
                     }
                 }
                 'PlainText' {
@@ -447,33 +756,42 @@ begin {
                     $textBoxStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+plainText\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                     $outerStyle = Get-FirstMatch $block '<div\s+style="([^"]*width:[^"]*display:\s*flex[^"]*)"'
-                    $font = (Get-CssNumber $textBoxStyle 'font-size' 20) * $a.ScaleY
+                    $fontLocal = Get-CssNumber $textBoxStyle 'font-size' 20
+                    # Whiteboard insets the text inside every plain-text box (see
+                    # $PlainTextInsetLeft): the glyphs start at local (17, 16), and the column
+                    # is the outer width minus both side insets. Placing the box at the anchor
+                    # point put every text ~17*s px left and ~16*s px high.
                     $width = Get-CssNumber $outerStyle 'width' 0
                     if ($width -le 0) { $width = Get-CssNumber $textBoxStyle 'max-width' 0 }
-                    if ($width -le 0) { $width = [Math]::Max(20, $text.Length * $font * 0.58 / $a.ScaleX) }
-                    $width *= $a.ScaleX
-                    $height = [Math]::Max($font * 1.25, [Math]::Ceiling(($text.Length * $font * 0.58) / [Math]::Max(1, $width)) * $font * 1.25)
+                    if ($width -gt 0) { $width = [Math]::Max(1, $width - $PlainTextInsetLeft - $PlainTextInsetRight) }
+                    else { $width = [Math]::Max(20, $text.Length * $fontLocal * 0.58) }
+                    $height = [Math]::Max($fontLocal * $TextLineHeight, [Math]::Ceiling(($text.Length * $fontLocal * 0.58) / [Math]::Max(1, $width)) * $fontLocal * $TextLineHeight)
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
-                    Add-TextElement $elements $text $a.X $a.Y $width $height $font $color $align
+                    $p = Get-BoxPlacement $a $PlainTextInsetLeft ($PlainTextInsetTop + ($TextBaselineShift * $fontLocal)) $width $height
+                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $color $align $p.Angle
                 }
                 'Note' {
                     $text = Get-HtmlText $block
                     $noteStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+stickyNote\b[^"]*"[^>]*style="([^"]*)"'
                     $backgroundStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxBackground\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
-                    $w = (Get-CssNumber $noteStyle 'width' 304) * $a.ScaleX
-                    $h = (Get-CssNumber $noteStyle 'height' 304) * $a.ScaleY
+                    $lw = Get-CssNumber $noteStyle 'width' 304
+                    $lh = Get-CssNumber $noteStyle 'height' 304
+                    $boxW = $lw + (2 * $NoteBorder); $boxH = $lh + (2 * $NoteBorder)
                     $bg = Convert-RgbaToHex (Get-StyleValue $backgroundStyle 'background-color') '#fee15a'
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $gradient = Get-LinearGradient $backgroundStyle
                     if ($null -ne $gradient) {
-                        Add-GradientRectangle $elements $a.X $a.Y $w $h $gradient.Start $gradient.End $GradientSteps
+                        Add-GradientRectangle $elements $a $boxW $boxH $gradient.Start $gradient.End $GradientSteps
                     } else {
-                        $e = New-BaseElement 'rectangle' $a.X $a.Y $w $h 'transparent' $bg 'solid' 1
+                        $p = Get-BoxPlacement $a 0 0 $boxW $boxH
+                        $e = New-BaseElement 'rectangle' $p.X $p.Y $p.Width $p.Height 'transparent' $bg 'solid' 1
+                        $e.angle = $p.Angle
                         $e.roundness = @{ type = 3 }; [void]$elements.Add([pscustomobject]$e)
                     }
-                    Add-TextElement $elements $text ($a.X + 12) ($a.Y + 12) ($w - 24) ($h - 24) (20 * $a.ScaleY) $color 'left'
+                    $p = Get-BoxPlacement $a 12 12 ($lw - 24) ($lh - 24)
+                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height (20 * $a.ScaleY) $color 'left' $p.Angle
                 }
                 'Connector' {
                     $svgTag = Get-FirstMatch $block '(<svg\b[^>]*>)'
@@ -485,24 +803,74 @@ begin {
                     if ($nums.Count -ge 4) {
                         $x1=$nums[0]; $y1=$nums[1]; $x2=$nums[2]; $y2=$nums[3]
                     } else { $x1=0; $y1=0; $x2=$w; $y2=$h }
-                    $minX=[Math]::Min($x1,$x2); $minY=[Math]::Min($y1,$y2)
-                    $dx=$x2-$x1; $dy=$y2-$y1
+                    # Endpoints go through the anchor's matrix, so scaled and rotated
+                    # connectors land where Whiteboard draws them. Excalidraw measures a linear
+                    # element's points from its first point, which sits at (x, y).
+                    $p1 = Get-BoardPoint $a $x1 $y1; $p2 = Get-BoardPoint $a $x2 $y2
+                    $dx = $p2[0] - $p1[0]; $dy = $p2[1] - $p1[1]
                     $stroke = Convert-RgbaToHex (Get-FirstMatch $gTag '\bstroke="([^"]+)"') '#1f1f1f'
                     $style = if ($gTag -match 'stroke-dasharray') { 'dashed' } else { 'solid' }
-                    $e = New-BaseElement 'line' ($a.X+$minX) ($a.Y+$minY) ([Math]::Abs($dx)) ([Math]::Abs($dy)) $stroke 'transparent' $style 2
+                    # Arrowheads: Whiteboard draws each as its own open chevron path inside the
+                    # connector's <g>, e.g. d="M-5 -9 L0 0 L5 -9" transform="translate(x,y), rotate(deg)"
+                    # (tip at the local origin). Previously only the first <path> was read, so
+                    # every arrowhead was dropped. Each tip is matched to the nearer endpoint
+                    # and becomes that end's Excalidraw arrowhead ("arrow" = open chevron).
+                    $startHead = $null; $endHead = $null
+                    $arrowRx = '<path\s+d="[^"]+"\s+transform="\s*translate\(\s*([-+0-9.eE]+)[\s,]+([-+0-9.eE]+)\s*\)\s*,?\s*rotate\(\s*[-+0-9.eE]+\s*\)\s*"'
+                    foreach ($am in [regex]::Matches($block, $arrowRx, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+                        $tipX = Get-Number $am.Groups[1].Value 0; $tipY = Get-Number $am.Groups[2].Value 0
+                        $toStart = [Math]::Pow($tipX - $x1, 2) + [Math]::Pow($tipY - $y1, 2)
+                        $toEnd = [Math]::Pow($tipX - $x2, 2) + [Math]::Pow($tipY - $y2, 2)
+                        if ($toStart -lt $toEnd) { $startHead = 'arrow' } else { $endHead = 'arrow' }
+                        $arrowheadCount++
+                    }
+                    # Excalidraw only draws arrowheads on "arrow" elements, not on "line".
+                    $lineType = if ($startHead -or $endHead) { 'arrow' } else { 'line' }
+                    $e = New-BaseElement $lineType $p1[0] $p1[1] ([Math]::Abs($dx)) ([Math]::Abs($dy)) $stroke 'transparent' $style 2
                     $pointList = New-Object Collections.ArrayList
                     [void]$pointList.Add([double[]]@(0,0)); [void]$pointList.Add([double[]]@($dx,$dy))
                     $e.points = $pointList; $e.lastCommittedPoint = $null
-                    $e.startBinding=$null; $e.endBinding=$null; $e.startArrowhead=$null; $e.endArrowhead=$null
+                    $e.startBinding=$null; $e.endBinding=$null; $e.startArrowhead=$startHead; $e.endArrowhead=$endHead
+                    if ($lineType -eq 'arrow') { $e.elbowed = $false }
                     [void]$elements.Add([pscustomobject]$e)
                 }
                 'ReactionStickers' {
                     $label = Get-FirstMatch $block 'aria-label="([^"]+)"'
                     $size = Get-ImageSize $block
-                    $w = $size.Width * $a.ScaleX; $h = $size.Height * $a.ScaleY
-                    $x = $a.X; $y = $a.Y
-                    if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
-                    Add-ReactionSticker $elements $label $x $y $w $h
+                    $stickerData = Get-EmbeddedImageData $block
+                    $stickerNative = if ($stickerData) { Get-RasterImageDimensions $stickerData.Bytes } else { $null }
+                    $boxW = $size.Width; $boxH = $size.Height
+                    if ($stickerNative) {
+                        # The sticker <img> is usually sized only by max-width/max-height, so
+                        # CSS shows it at its own size, shrunk (never enlarged) to fit that box.
+                        $imgStyle = Get-FirstMatch $block '<img[^>]*style="([^"]*)"'
+                        $hasExplicitSize = ($null -ne (Get-FirstMatch $imgStyle '(?:^|;)\s*width\s*:\s*[0-9.]+px')) -or
+                                           ($null -ne (Get-FirstMatch $imgStyle '(?:^|;)\s*height\s*:\s*[0-9.]+px'))
+                        if (-not $hasExplicitSize) {
+                            $fit = [Math]::Min(1.0, [Math]::Min($boxW / $stickerNative.Width, $boxH / $stickerNative.Height))
+                            $boxW = $stickerNative.Width * $fit; $boxH = $stickerNative.Height * $fit
+                        }
+                    }
+                    $u0 = 0.0; $v0 = 0.0
+                    if ($a.IsCentered) { $u0 = -$boxW / 2; $v0 = -$boxH / 2 }
+                    $p = Get-BoxPlacement $a $u0 $v0 $boxW $boxH
+                    if ($stickerData) {
+                        # Embed Whiteboard's own sticker artwork (an SVG for every built-in
+                        # sticker) so any sticker type -- heart, fire, like, light bulb, and any
+                        # added later -- converts faithfully, instead of mapping known labels
+                        # to hand-drawn stand-ins and printing '?' for everything else.
+                        $fileId = New-Id
+                        $dataUrl = 'data:{0};base64,{1}' -f $stickerData.Mime, [Convert]::ToBase64String($stickerData.Bytes)
+                        $files[$fileId] = [ordered]@{ mimeType=$stickerData.Mime; id=$fileId; dataURL=$dataUrl; created=1; lastRetrieved=1 }
+                        $e = New-BaseElement 'image' $p.X $p.Y $p.Width $p.Height 'transparent' 'transparent' 'solid' 1
+                        $e.angle = $p.Angle
+                        $e.fileId=$fileId; $e.status='saved'; $e.scale=@(1,1); $e.crop=$null
+                        [void]$elements.Add([pscustomobject]$e)
+                        $stickerImageCount++
+                    } else {
+                        Add-ReactionSticker $elements $label $p.X $p.Y $p.Width $p.Height
+                        $stickerFallbackCount++
+                    }
                 }
                 {$_ -in 'Image', 'AzureImage'} {
                     # Newer Whiteboard exports tag images as "AzureImage" rather
@@ -511,9 +879,10 @@ begin {
                     if (-not $src) { [void]$unsupported.Add("$($a.Type):$($a.Key) (missing image data)"); break }
                     $src = [Net.WebUtility]::HtmlDecode($src)
                     $size = Get-ImageSize $block
-                    $w = $size.Width * $a.ScaleX; $h = $size.Height * $a.ScaleY
-                    $x = $a.X; $y = $a.Y
-                    if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
+                    $u0 = 0.0; $v0 = 0.0
+                    if ($a.IsCentered) { $u0 = -$size.Width / 2; $v0 = -$size.Height / 2 }
+                    $p = Get-BoxPlacement $a $u0 $v0 $size.Width $size.Height
+                    $x = $p.X; $y = $p.Y; $w = $p.Width; $h = $p.Height
                     $mime = Get-FirstMatch $src '^data:([^;,]+)'
                     if (-not $mime) { [void]$unsupported.Add("$($a.Type):$($a.Key) (external image URL)"); break }
                     $commaIndex = $src.IndexOf(',')
@@ -529,6 +898,7 @@ begin {
                     $fileId = New-Id
                     $files[$fileId] = [ordered]@{ mimeType=$mime; id=$fileId; dataURL=$src; created=1; lastRetrieved=1 }
                     $e = New-BaseElement 'image' $x $y $w $h 'transparent' 'transparent' 'solid' 1
+                    $e.angle = $p.Angle
                     $e.fileId=$fileId; $e.status='saved'; $e.scale=@(1,1); $e.crop=$null
                     [void]$elements.Add([pscustomobject]$e)
 
@@ -581,6 +951,10 @@ begin {
             EmbeddedFiles=$files.Count; UnsupportedObjects=$unsupported.Count
             UnsupportedDetails=@($unsupported); SourceTypeCounts=$sourceTypes
             ImageFiles=@($imageFilesWritten)
+            StickersEmbedded=$stickerImageCount; StickersFallback=$stickerFallbackCount
+            ShapesTraced=$shapeTracedCount; ShapesFromLabel=$shapeFallbackCount
+            RotatedObjects=$rotatedCount; ArrowheadsConverted=$arrowheadCount
+            MirrorIgnored=$mirrorIgnored.Count; MirrorIgnoredDetails=@($mirrorIgnored)
         }
     }
 }
@@ -607,6 +981,16 @@ process {
         if ($result.ImageFiles.Count -gt 0) {
             Write-Host ("  Also wrote {0} standalone image file(s) to: {1}" -f `
                 $result.ImageFiles.Count, (Split-Path -Parent $result.ImageFiles[0]))
+        }
+        if ($result.StickersFallback -gt 0) {
+            Write-Warning ("{0} reaction sticker(s) had no embedded artwork and were drawn with a fallback symbol." -f $result.StickersFallback)
+        }
+        if ($result.ShapesFromLabel -gt 0) {
+            Write-Warning ("{0} shape(s) had an outline that couldn't be traced and were built from their label." -f $result.ShapesFromLabel)
+        }
+        if ($result.MirrorIgnored -gt 0) {
+            Write-Warning ("{0} mirrored object(s) were drawn unmirrored (Excalidraw can't mirror): {1}" -f `
+                $result.MirrorIgnored, ($result.MirrorIgnoredDetails -join ', '))
         }
         if ($result.UnsupportedObjects -gt 0) {
             Write-Warning ("{0} object(s) were unsupported. Details: {1}" -f `

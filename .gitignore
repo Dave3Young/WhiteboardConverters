@@ -1,0 +1,5 @@
+# Test outputs and the local Python environment for the visual checks
+tests/out/
+tests/.venv/
+__pycache__/
+*.pyc
