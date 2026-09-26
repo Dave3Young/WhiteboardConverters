@@ -83,6 +83,10 @@ begin {
     $PlainTextInsetRight = 16
     $PlainTextInsetTop   = 16
 
+    # ".stickyNote { border-width: 1px }" sits outside the note's CSS width/height, and the
+    # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
+    $NoteBorder = 1
+
     # ===================================================================================
     # Parsing helpers -- verbatim from Convert-WhiteboardHtmlToExcalidraw-v2_solid_c.ps1
     # ===================================================================================
@@ -1000,8 +1004,8 @@ begin {
                     $noteStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+stickyNote\b[^"]*"[^>]*style="([^"]*)"'
                     $backgroundStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxBackground\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
-                    $w = (Get-CssNumber $noteStyle 'width' 304) * $a.ScaleX
-                    $h = (Get-CssNumber $noteStyle 'height' 304) * $a.ScaleY
+                    $w = ((Get-CssNumber $noteStyle 'width' 304) + (2 * $NoteBorder)) * $a.ScaleX
+                    $h = ((Get-CssNumber $noteStyle 'height' 304) + (2 * $NoteBorder)) * $a.ScaleY
                     $bg = Convert-RgbaToHex (Get-StyleValue $backgroundStyle 'background-color') '#fee15a'
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     # v2: solid fill only, even if the source note used a CSS gradient
