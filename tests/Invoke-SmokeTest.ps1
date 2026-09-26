@@ -30,12 +30,12 @@ is written to tests\out\smoke-results.json.
 #>
 [CmdletBinding()]
 param(
-    # Folder holding the two Convert-WhiteboardHtmlToOpenBoard-*.ps1 scripts.
-    [string] $ScriptDirectory = (Split-Path -Parent $PSScriptRoot),
+    # Folder holding the two Convert-WhiteboardHtmlToOpenBoard-*.ps1 scripts (default: repo root).
+    [string] $ScriptDirectory,
     # Folder holding one sub-folder per sample, each with a Whiteboard .html export.
-    [string] $SampleDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'samples'),
-    # Where the .ubz files and smoke-results.json are written.
-    [string] $OutputDirectory = (Join-Path $PSScriptRoot 'out'),
+    [string] $SampleDirectory,
+    # Where the .ubz files and smoke-results.json are written (default: tests\out).
+    [string] $OutputDirectory,
     # Limit the run to these sample names (folder names); default is all.
     [string[]] $Sample,
     [ValidateSet('v2_solid', 'v3_gradient')]
@@ -44,6 +44,11 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+# Defaults are resolved here, not in param(): under "powershell.exe -File", Windows PowerShell
+# 5.1 leaves $PSScriptRoot empty while an advanced script's parameter defaults are evaluated.
+if (-not $ScriptDirectory) { $ScriptDirectory = Split-Path -Parent $PSScriptRoot }
+if (-not $SampleDirectory) { $SampleDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) 'samples' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot 'out' }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 

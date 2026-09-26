@@ -45,7 +45,7 @@ UB_PARENT = "{http://uniboard.mnemis.com/document}parent"
 VERSIONS = ("v2_solid", "v3_gradient")
 
 # Pass/fail tolerances in board pixels.
-TOL = {"text": 5.0, "sticker": 0.5, "shape": 1.5, "arrow": 0.5}
+TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5}
 
 
 # ----------------------------------------------------------------------------------------
@@ -80,8 +80,12 @@ def find_powershell(explicit: str | None) -> list[str]:
 
 def convert(ps: list[str], script: Path, html: Path, out_dir: Path) -> tuple[Path | None, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = ps + ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-                "-InputPath", str(html), "-OutputDirectory", str(out_dir), "-Force"]
+    # -Command with the call operator rather than -File: with stdin redirected (CI, IDE and agent
+    # shells), "powershell.exe -File" feeds stdin to the script as pipeline input, so the
+    # converter's process {} block runs once per stdin line -- zero times for empty stdin.
+    q = lambda s: "'" + str(s).replace("'", "''") + "'"
+    cmd = ps + ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                f"& {q(script)} -InputPath {q(html)} -OutputDirectory {q(out_dir)} -Force; exit $LASTEXITCODE"]
     p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     ubz = out_dir / (html.stem + ".ubz")
     log = (p.stdout + p.stderr).strip()
@@ -92,7 +96,7 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path) -> tuple[Pat
 # Whiteboard side: measure the export in the browser
 # ----------------------------------------------------------------------------------------
 JS_HTML = r"""() => {
-  const cal = [], texts = [], stickers = [], shapes = [], arrows = [];
+  const cal = [], texts = [], stickers = [], shapes = [], arrows = [], notes = [];
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   document.querySelectorAll('div.anchor[data-whiteboard-type]').forEach(a => {
     const st = a.getAttribute('style') || '', r = a.getBoundingClientRect();
@@ -111,6 +115,10 @@ JS_HTML = r"""() => {
       const i = a.querySelector('img').getBoundingClientRect();
       stickers.push([i.left + scrollX, i.top + scrollY, i.width, i.height]);
     }
+    if (type === 'Note') {
+      const b = a.querySelector('.textBoxBackground').getBoundingClientRect();
+      notes.push([b.left + scrollX, b.top + scrollY, b.width, b.height]);
+    }
     if (type === 'Shape') {
       const svg = a.querySelector('svg.shape'), p = svg && svg.querySelector('g > path');
       if (p) {
@@ -128,7 +136,7 @@ JS_HTML = r"""() => {
               .filter(r => r.width > 0 && r.height > 0);
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
-  return {cal, texts, stickers, shapes, arrows, bbox};
+  return {cal, texts, stickers, shapes, arrows, notes, bbox};
 }"""
 
 
@@ -154,6 +162,7 @@ def measure_html(page, html: Path, shot: Path) -> dict:
     return {
         "texts": [dict(t, bx=to_b(t["x"], t["y"])[0], by=to_b(t["x"], t["y"])[1], bh=t["h"] / ky) for t in d["texts"]],
         "stickers": [(*to_b(s[0], s[1]), s[2] / kx, s[3] / ky) for s in d["stickers"]],
+        "notes": [(*to_b(s[0], s[1]), s[2] / kx, s[3] / ky) for s in d["notes"]],
         "shapes": [{"label": s["label"], "pts": [to_b(*q) for q in s["pts"]]} for s in d["shapes"]],
         "arrows": [[to_b(*q) for q in a] for a in d["arrows"]],
     }
@@ -211,13 +220,15 @@ def measure_ubz(page, ubz: Path, shot: Path) -> dict:
     page.screenshot(path=str(shot), full_page=True)
     texts = [dict(t, bx=t["x"] + cx, by=t["y"] + cy) for t in page.evaluate(JS_SVG)]
 
-    stickers, groups, lines = [], {}, set()
+    stickers, groups, lines, notes = [], {}, set(), []
     for el in root:
         tag = el.tag.replace(SVG, "")
         if tag == "image" and el.get(XLINK_HREF, "").endswith(".svg"):
             m = [float(v) for v in re.findall(r"-?[\d.]+(?:[eE]-?\d+)?", el.get("transform"))]
             stickers.append((m[4] + cx, m[5] + cy, float(el.get("width")) * m[0], float(el.get("height")) * m[3]))
         par = el.get(UB_PARENT)
+        if tag == "polygon" and not par:   # v2 note: the only ungrouped fill polygon
+            notes.append([(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())])
         if tag in ("polygon", "polyline") and par:
             pts = [(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())]
             g = groups.setdefault(par, {"polygon": 0, "polyline": 0})
@@ -231,7 +242,17 @@ def measure_ubz(page, ubz: Path, shot: Path) -> dict:
     arrows = [g_pts for par in lines for g_pts in
               [pts for el in root if el.tag == SVG + "polyline" and el.get(UB_PARENT) == par
                for pts in [[(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())]]]]
-    return {"texts": texts, "stickers": stickers, "shapes": shapes, "arrows": arrows}
+    # v3 note: one group of gradient bands (each band overlaps the next by 0.15 px).
+    for par in {el.get(UB_PARENT) for el in root if el.tag == SVG + "polygon" and el.get(UB_PARENT)}:
+        bands = [[(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())]
+                 for el in root if el.tag == SVG + "polygon" and el.get(UB_PARENT) == par]
+        if len(bands) > 1:
+            pts = [p for band in bands for p in band]
+            notes.append([(min(p[0] for p in pts), min(p[1] for p in pts)),
+                          (max(p[0] for p in pts), max(p[1] for p in pts) - 0.15)])
+    note_boxes = [(min(p[0] for p in n), min(p[1] for p in n),
+                   max(p[0] for p in n) - min(p[0] for p in n), max(p[1] for p in n) - min(p[1] for p in n)) for n in notes]
+    return {"texts": texts, "stickers": stickers, "notes": note_boxes, "shapes": shapes, "arrows": arrows}
 
 
 # ----------------------------------------------------------------------------------------
@@ -265,6 +286,15 @@ def compare(src: dict, out: dict) -> dict:
     # Stickers: same order in both.
     se = [max(abs(a - b) for a, b in zip(s, o)) for s, o in zip(src["stickers"], out["stickers"])]
     res["sticker"] = {"expected": len(src["stickers"]), "matched": len(out["stickers"]), "max": round(max(se), 2) if se else None}
+    # Notes: pair each true note box with the nearest output box; largest edge error.
+    ne, pool = [], list(out["notes"])
+    for s in src["notes"]:
+        if not pool: break
+        c = (s[0] + s[2] / 2, s[1] + s[3] / 2)
+        j = min(range(len(pool)), key=lambda i: math.hypot(pool[i][0] + pool[i][2] / 2 - c[0], pool[i][1] + pool[i][3] / 2 - c[1]))
+        o = pool.pop(j)
+        ne.append(max(abs(s[0] - o[0]), abs(s[1] - o[1]), abs(s[0] + s[2] - o[0] - o[2]), abs(s[1] + s[3] - o[1] - o[3])))
+    res["note"] = {"expected": len(src["notes"]), "matched": len(out["notes"]), "max": round(max(ne), 2) if ne else None}
     # Shapes: same order; max distance both ways between true outline and output polygon.
     sh = []
     for s, o in zip(src["shapes"], out["shapes"]):
@@ -281,7 +311,7 @@ def compare(src: dict, out: dict) -> dict:
     fails = []
     if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
     if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
-    for k in ("sticker", "shape", "arrow"):
+    for k in ("sticker", "note", "shape", "arrow"):
         if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
         if res[k]["max"] is not None and res[k]["max"] > TOL[k]: fails.append(f"{k} off by {res[k]['max']} px")
     res["fails"] = fails
@@ -300,7 +330,7 @@ def write_report(out_root: Path, results: list[dict]):
         return f"<td>{v['matched']}/{v['expected']}" + (f" · max {v['max']}" if v['max'] is not None else "") + "</td>"
     rows = "".join(
         f"<tr class='{'bad' if r['status'] != 'PASS' else ''}'><td>{r['board']}</td><td>{r['version']}</td><td>{r['status']}</td>"
-        + "".join(cell(r, k) for k in ("text", "sticker", "shape", "arrow"))
+        + "".join(cell(r, k) for k in ("text", "sticker", "note", "shape", "arrow"))
         + f"<td>{'; '.join(r.get('fails', []))}</td></tr>" for r in results)
     boards = sorted({r["board"] for r in results})
     figs = ""
@@ -317,9 +347,9 @@ th{{background:#f1eff6}} tr.bad td{{background:#fde8e8}} .grid{{display:grid;gri
 figure{{margin:0;background:#f1eff6;padding:6px;border-radius:6px}} img{{width:100%;background:#fff}}
 figcaption{{font-size:12px;color:#666;text-align:center}}</style></head><body>
 <h1>Whiteboard → OpenBoard visual checks</h1>
-<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, sticker {TOL['sticker']}, shape {TOL['shape']}, arrowhead {TOL['arrow']}.
+<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, sticker {TOL['sticker']}, note {TOL['note']}, shape {TOL['shape']}, arrowhead {TOL['arrow']}.
 Renders show the .ubz page as OpenBoard lays it out (approximation in Chromium).</p>
-<table><tr><th>Board</th><th>Script</th><th>Status</th><th>Text</th><th>Stickers</th><th>Shapes</th><th>Arrowheads</th><th>Problems</th></tr>{rows}</table>
+<table><tr><th>Board</th><th>Script</th><th>Status</th><th>Text</th><th>Stickers</th><th>Notes</th><th>Shapes</th><th>Arrowheads</th><th>Problems</th></tr>{rows}</table>
 {figs}</body></html>"""
     (out_root / "report.html").write_text(doc, encoding="utf-8")
 
@@ -367,7 +397,7 @@ def main():
                 results.append(r)
                 c = r.get("checks", {})
                 print(f"{d.name:24} {v:12} {r['status']:5}  text max {c.get('text', {}).get('max')}  "
-                      f"sticker {c.get('sticker', {}).get('max')}  shape {c.get('shape', {}).get('max')}  "
+                      f"sticker {c.get('sticker', {}).get('max')}  note {c.get('note', {}).get('max')}  shape {c.get('shape', {}).get('max')}  "
                       f"arrow {c.get('arrow', {}).get('max')}  {'; '.join(r.get('fails', []))}", flush=True)
         browser.close()
     (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
