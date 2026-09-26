@@ -23,6 +23,10 @@ Windows-only.
 - Anything the converter can't reproduce faithfully is **reported in the run summary**, never
   silently dropped or approximated. Examples: dashed strokes drawn solid, rotated non-text
   objects drawn unrotated, sticker fallbacks, shapes built from their label.
+- Two Windows PowerShell 5.1 traps under `powershell.exe -File`: `$PSScriptRoot` is empty while
+  an advanced script's `param()` defaults are evaluated (resolve paths in the body), and with
+  stdin redirected the script's `process {}` block runs once per stdin line, i.e. never for
+  empty stdin. Launch scripts from other processes with `-Command "& 'script.ps1' ..."`.
 
 ## Tests (run before and after every change)
 ```powershell
@@ -42,8 +46,9 @@ Windows-only.
   - how they work: they convert with a temporary *instrumented copy* of each script (it adds
     one `<!-- TESTCENTER x y -->` comment so board coordinates can be recovered). They then
     measure the Whiteboard HTML and the rendered `.ubz` in headless Chromium.
-  - tolerances, in board px: text 5, sticker 0.5, shape 1.5, arrowhead 0.5.
-  - current results: text ≤ 3.3 (median 0–1), stickers 0.0, shapes ≤ 0.92, arrowheads 0.01.
+  - tolerances, in board px: text 5, sticker 0.5, note 0.5, shape 1.5, arrowhead 0.5.
+  - current results: text ≤ 3.3 (median 0–1), stickers 0.0, notes ≤ 0.01, shapes ≤ 0.92,
+    arrowheads 0.01.
 - Both suites were mutation-tested against the original pre-fix scripts, and flag every bug
   listed below.
 
@@ -76,7 +81,9 @@ Windows-only.
   - Each arrowhead is a separate open chevron `d="M-5 -9 L0 0 L5 -9"` with
     `transform="translate(x,y), rotate(deg)"` and its tip at the origin.
   - Dashed lines use `stroke-dasharray`.
-- **Note:** the background is `background-color` (the solid fallback) plus
+- **Note:** `.stickyNote { border-width: 1px }` sits outside the CSS `width`/`height`, and the
+  background fills it, so a 304 × 304 note shows as **306 × 306** at (left, top).
+- **Note background:** the background is `background-color` (the solid fallback) plus
   `background-image: ..., linear-gradient(start, end)`. The fallback can differ visibly from
   the gradient; blue notes are the clearest case.
 - **Image / AzureImage:** a base64 data URI. AzureImage declares the MIME type `image/*`, so the
@@ -124,6 +131,8 @@ All details below were verified against OpenBoard's own `src/adaptors/UBSvgSubse
    counts/warns on other rotated types.
 5. **Arrowheads were dropped:** the fix converts each chevron to a polyline grouped with its
    line through `ub:parent`.
+6. **Notes were 2 px too small:** the 1 px `.stickyNote` border was ignored. The fix adds
+   `2 * $NoteBorder` to the note size; the visual checks now measure notes too.
 
 ## Open items
 - **Sticky-note text is unverified.** Every note in all 10 samples is empty.
