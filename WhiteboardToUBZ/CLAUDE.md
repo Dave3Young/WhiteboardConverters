@@ -19,6 +19,8 @@ Windows-only.
 - Keep `Set-StrictMode -Version 2.0` clean.
 - Watch the comma operator: `@($a + $b, $c)` parses as `$a + ($b, $c)`. Parenthesise the
   arithmetic, or build point lists with `List[double[]]` and `.Add()`.
+- Watch integer literals in `[Math]::Max`/`Min`: `[Math]::Max(1, $w)` picks the
+  `Max(int, int)` overload and rounds a fractional `$w` to whole px. Write `1.0`.
 - OpenBoard `ub:uuid` / `ub:parent` values must be canonical GUID strings (`New-UbzUuid`).
 - Anything the converter can't reproduce faithfully is **reported in the run summary**, never
   silently dropped or approximated. Examples: dashed strokes drawn solid, rotated non-text
@@ -155,6 +157,8 @@ All details below were verified against OpenBoard's own `src/adaptors/UBSvgSubse
    (`ConvertTo-BoardPoints`); shape labels turn with the shape.
 10. **Bold was dropped:** weight-600 headings drew narrower, so centred and right-aligned ones
     moved 5-31 px. The fix writes `font-weight` (`Get-FontWeight`).
+11. **Sizes were rounded to whole px:** int-literal `[Math]::Max(1, ...)` calls rounded sticker
+    sizes, text columns, shape-label boxes and native SVG sizes. The fix uses double literals.
 
 ## Open items
 - **Shape text** is unverified: no sample has any.
