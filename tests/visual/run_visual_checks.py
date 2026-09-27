@@ -240,6 +240,10 @@ def outline(e, off):
         pts = [(c[0] + w / 2 * math.cos(2 * math.pi * i / 180), c[1] + h / 2 * math.sin(2 * math.pi * i / 180)) for i in range(180)]
     else:   # closed polygon "line"
         pts = [(x + p[0], y + p[1]) for p in e["points"][:-1]]
+        # (x, y) is a line's first point, not its box corner: Excalidraw rotates a linear
+        # element about the centre of its points' bounds.
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        c = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
     return [rotate_about(p, c, a) for p in pts]
 
 
