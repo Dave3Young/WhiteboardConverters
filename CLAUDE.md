@@ -34,21 +34,22 @@ Windows-only.
 .\tests\Setup-VisualTests.ps1         # once: Python venv + Playwright Chromium (-InstallPython if needed)
 .\tests\Invoke-VisualTests.ps1        # geometry vs. Whiteboard's real layout; opens tests\out\visual\report.html
 ```
-- `samples\` holds 10 real Whiteboard exports. Add new ones as `samples\<Name>\<Name>.html`,
+- `samples\` holds 59 real Whiteboard exports. Add new ones as `samples\<Name>\<Name>.html`,
   plus its `-comments.json`.
 - **Smoke test** (`Invoke-SmokeTest.ps1`), which judges the output alone:
   - the zip and XML are valid; `ub:version` is 4.8.0; GUIDs are valid; referenced images exist
     and parse; all content is inside the viewBox;
-  - every PlainText string is present verbatim, with no `?` glyphs;
+  - every PlainText string is present verbatim, line breaks included (`<br>` in the Qt HTML),
+    with no `?` glyphs;
   - stickers are embedded as SVG; ovals are drawn round;
-  - arrowheads are grouped with their line; rotated text is really rotated.
+  - arrowheads are grouped with their line; rotated text and shapes are really rotated.
 - **Visual checks** (`tests\visual\run_visual_checks.py`):
   - how they work: they convert with a temporary *instrumented copy* of each script (it adds
     one `<!-- TESTCENTER x y -->` comment so board coordinates can be recovered). They then
     measure the Whiteboard HTML and the rendered `.ubz` in headless Chromium.
   - tolerances, in board px: text 5, sticker 0.5, note 0.5, shape 1.5, arrowhead 0.5.
-  - current results: text ≤ 3.3 (median 0–1), stickers 0.0, notes ≤ 0.01, shapes ≤ 0.92,
-    arrowheads 0.01.
+  - current results (59 samples): text ≤ 3.0 (median 0–1), stickers 0.0, notes ≤ 0.01,
+    shapes ≤ 0.92, arrowheads 0.01.
 - Both suites were mutation-tested against the original pre-fix scripts, and flag every bug
   listed below.
 
@@ -69,6 +70,15 @@ Windows-only.
     translateY of −16·s cancels the top padding.
   - The column width is `outerWidth − 33` (pre-scale). Alignment comes from the
     `DraftEditor-align*` class.
+  - The weight is an inline `font-weight` on `.textBoxCore`: template headings are 600, some
+    labels 700. The face is `sans-serif`, which renders as Arial.
+- **Line breaks:** a soft break inside a span is stored as a raw **CR or CRLF**, which a browser
+  reads as a newline under `pre-wrap`. `Get-HtmlText` normalises both to LF.
+- **Note text:** at **(+14, +1)** from the note's outer corner (1 px border, 12 px
+  `.textBoxCoreWrapper` side padding, 1 px Draft.js gutter; the inline `padding: 0px` on
+  `.textBoxCore` overrides the stylesheet's 12/16 px). The column is `width − 25`, top-left
+  aligned, **24 px** (`.stickyNote.fixedFontSize`, on every note seen) and **bold** (700).
+  The font stack starts with Aptos, and renders as Segoe UI when Aptos is absent.
 - **Shape:** the first `<path d>` inside `svg.shape > g` is the exact outline, centred by
   `translate(w/2 h/2)` on the `<g>`.
   - Rectangles are M/L/Z.
@@ -100,6 +110,8 @@ All details below were verified against OpenBoard's own `src/adaptors/UBSvgSubse
     it, **rotation included**.
 - **Text:** `<foreignObject ub:type="text">` with `<itemTextContent>`, which holds the escaped
   Qt rich-text HTML.
+  - Qt collapses raw newlines to spaces, so line breaks are written as `<br />`.
+  - The `<p>` style carries `font-weight`, so bold headings keep their width and alignment.
 - **Images:** width/height on `<image>` are **ignored**, because pixmap and SVG items aren't
   `UBResizableGraphicsItem`.
   - Set width/height to the file's native size, and put the scale in the matrix:
@@ -133,17 +145,23 @@ All details below were verified against OpenBoard's own `src/adaptors/UBSvgSubse
    line through `ub:parent`.
 6. **Notes were 2 px too small:** the 1 px `.stickyNote` border was ignored. The fix adds
    `2 * $NoteBorder` to the note size; the visual checks now measure notes too.
+7. **Line breaks were lost:** raw CR/CRLF went into the Qt `<p>` and collapsed to spaces (e.g.
+   "Subject: Instructor: Course Date:" on one line). The fix normalises them in `Get-HtmlText`
+   and writes `<br />`.
+8. **Note text was 11 px too low, at 20 px regular:** the inset was a guess. The fix uses the
+   measured `$NoteTextInset*` constants, 24 px and the note's weight.
+9. **Rotated shapes were drawn unrotated:** 180-degree block arrows pointed the wrong way. The
+   fix traces the outline in local px and maps it through the full matrix
+   (`ConvertTo-BoardPoints`); shape labels turn with the shape.
+10. **Bold was dropped:** weight-600 headings drew narrower, so centred and right-aligned ones
+    moved 5-31 px. The fix writes `font-weight` (`Get-FontWeight`).
 
 ## Open items
-- **Sticky-note text is unverified.** Every note in all 10 samples is empty.
-  - The code still uses a guessed +12/+12 inset and `w − 24` width.
-  - The CSS shows `.stickyNote .textBoxCore { padding: 12px }` (16px with `fixedFontSize`),
-    plus `.textBoxCoreWrapper { padding: 0 12px 12px }`.
-  - Needs an export with typed notes.
 - **Shape text** is unverified: no sample has any.
-- **Rotation** is native only for PlainText. Other rotated types are drawn unrotated at the
-  correct size.
+- **Rotation** is native for PlainText and shapes. Other rotated types (notes, images,
+  stickers) are drawn unrotated at the correct size; none are rotated in the samples.
 - **Elbow/curved connectors:** none seen yet. The main line reads only its first 2 points.
-- **Formatting losses:** bold, underline and the font face are dropped (text is plain Arial).
-  Dashed strokes are drawn solid.
+- **Formatting losses:** underline and the font face are dropped (text is Arial). Note text
+  is drawn in Arial, not Segoe UI/Aptos, so its lines can wrap a little differently. A space
+  after a soft line break is collapsed. Dashed strokes are drawn solid.
 - **Option:** v2 notes could use the gradient midpoint instead of the solid fallback colour.
