@@ -233,8 +233,10 @@ begin {
               [string]$Stroke = '#1f1f1f', [string]$Background = 'transparent',
               [string]$StrokeStyle = 'solid', [int]$StrokeWidth = 2)
         return [ordered]@{
+            # 1.0, not 1: with an int first argument PowerShell picks Math.Max(int, int) and
+            # rounds the size to whole px (a 2794.93 px image became 2795).
             id = New-Id; type = $Type; x = $X; y = $Y
-            width = [Math]::Max(1, $Width); height = [Math]::Max(1, $Height)
+            width = [Math]::Max(1.0, $Width); height = [Math]::Max(1.0, $Height)
             angle = 0; strokeColor = $Stroke; backgroundColor = $Background
             fillStyle = 'solid'; strokeWidth = $StrokeWidth; strokeStyle = $StrokeStyle
             roughness = 0; opacity = 100; groupIds = @(); frameId = $null
@@ -468,7 +470,7 @@ begin {
         $FontSize = Get-ScalarDouble $FontSize 20
         $lineHeight = if ($LineHeight -gt 0) { $LineHeight } else { $TextLineHeight }
         $fontFamily = 2 # Helvetica/sans-serif in Excalidraw
-        $estimatedWidth = [Math]::Max(1, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
+        $estimatedWidth = [Math]::Max(1.0, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
         if ($Width -le 1) { $Width = $estimatedWidth }
         if ($Height -le 1) {
             $charsPerLine = [Math]::Max(1, [Math]::Floor($Width / ($FontSize * 0.58)))
@@ -477,6 +479,20 @@ begin {
         }
         $wrapped = (Get-WrappedLines $Text $Width $FontSize) -join "`n"
         if ($wrapped.Trim().Length -eq 0) { $wrapped = $Text }   # whitespace-only boxes keep their spaces
+        # A line that can't wrap (a single glyph wider than the column, e.g. a huge "W") overflows
+        # its column in Whiteboard, but Excalidraw clips text to the element's width. Widen the
+        # element to the widest line around its alignment anchor; the centre moves along the
+        # element's own x axis, so rotated text stays put too.
+        $widest = 0.0
+        foreach ($line in ($wrapped -split "`n")) { $widest = [Math]::Max($widest, (Measure-TextWidth $line $FontSize)) }
+        if ($widest -gt $Width) {
+            $extra = $widest - $Width
+            $shift = switch ($Align) { 'center' { 0.0 } 'right' { -$extra / 2 } default { $extra / 2 } }
+            $cx = $X + ($Width / 2) + ($shift * [Math]::Cos($Angle))
+            $cy = $Y + ($Height / 2) + ($shift * [Math]::Sin($Angle))
+            $Width = $widest
+            $X = $cx - ($Width / 2); $Y = $cy - ($Height / 2)
+        }
         $e = New-BaseElement 'text' $X $Y $Width $Height $Color 'transparent' 'solid' 1
         $e.fontSize = $FontSize; $e.fontFamily = $fontFamily
         $e.text = $wrapped; $e.rawText = $Text; $e.originalText = $Text
@@ -493,7 +509,7 @@ begin {
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
         $Width = Get-ScalarDouble $Width 40; $Height = Get-ScalarDouble $Height 40
         $groupId = New-Id
-        $size = [Math]::Max(16, [Math]::Min($Width, $Height))
+        $size = [Math]::Max(16.0, [Math]::Min($Width, $Height))
 
         if ($Label -match 'red cross') {
             foreach ($direction in @('down', 'up')) {
@@ -814,8 +830,23 @@ begin {
                         $p = Get-BoxPlacement $a $boxU $boxV $boxW $boxH
                         $e = New-BaseElement $kind $p.X $p.Y $p.Width $p.Height $stroke $fill $strokeStyle 2
                         $e.angle = $p.Angle
+                    } elseif (-not $a.IsMirrored) {
+                        # Closed polygon through the traced outline, built unrotated (scaled only)
+                        # inside the outline's box and turned by "angle" -- Excalidraw rotates a
+                        # line about the centre of its points' bounds, which is the box centre --
+                        # so its selection box and rotate handle follow it like any rotated shape.
+                        $p = Get-BoxPlacement $a $boxU $boxV $boxW $boxH
+                        $local = @($outline | ForEach-Object { ,([double[]]@((($_[0] - $boxU) * $a.ScaleX), (($_[1] - $boxV) * $a.ScaleY))) })
+                        $pointList = New-Object Collections.ArrayList
+                        foreach ($lp in $local) { [void]$pointList.Add([double[]]@(($lp[0] - $local[0][0]), ($lp[1] - $local[0][1]))) }
+                        [void]$pointList.Add([double[]]@(0, 0))
+                        $e = New-BaseElement 'line' ($p.X + $local[0][0]) ($p.Y + $local[0][1]) $p.Width $p.Height $stroke $fill $strokeStyle 2
+                        $e.angle = $p.Angle
+                        $e.points = $pointList; $e.polygon = $true; $e.lastCommittedPoint = $null
+                        $e.startBinding = $null; $e.endBinding = $null; $e.startArrowhead = $null; $e.endArrowhead = $null
                     } else {
-                        # Closed polygon through the traced outline, mapped through the full matrix.
+                        # Mirrored: Excalidraw can't mirror an element, so the outline is mapped
+                        # through the full matrix instead (right geometry, axis-aligned box).
                         $board = @($outline | ForEach-Object { Get-BoardPoint $a $_[0] $_[1] })
                         $x0 = $board[0][0]; $y0 = $board[0][1]
                         $pointList = New-Object Collections.ArrayList
@@ -836,8 +867,8 @@ begin {
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                         $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
-                        $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $lw - 26))
-                        $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $lh - 26))
+                        $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1.0, $lw - 26))
+                        $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1.0, $lh - 26))
                         $textHeight = [Math]::Min($innerHeight, (Get-TextBlockHeight $shapeText $innerWidth $fontLocal))
                         $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2)) $innerWidth $textHeight
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
@@ -857,8 +888,8 @@ begin {
                     # point put every text ~17*s px left and ~16*s px high.
                     $width = Get-CssNumber $outerStyle 'width' 0
                     if ($width -le 0) { $width = Get-CssNumber $textBoxStyle 'max-width' 0 }
-                    if ($width -gt 0) { $width = [Math]::Max(1, $width - $PlainTextInsetLeft - $PlainTextInsetRight) }
-                    else { $width = [Math]::Max(20, $text.Length * $fontLocal * 0.58) }
+                    if ($width -gt 0) { $width = [Math]::Max(1.0, $width - $PlainTextInsetLeft - $PlainTextInsetRight) }
+                    else { $width = [Math]::Max(20.0, $text.Length * $fontLocal * 0.58) }
                     $height = Get-TextBlockHeight $text $width $fontLocal
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
