@@ -74,6 +74,35 @@ begin {
     # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
     $NoteBorder = 1
 
+    # Excalidraw draws each text element's "text" exactly as stored, one line per newline:
+    # it never re-wraps a free-standing text on load, and it clips whatever overflows the
+    # element's width. Whiteboard wraps to the column instead, so the converter breaks the
+    # lines itself, the way Chromium lays them out. Widths are Arial's advance widths (in
+    # 1/2048 em, code points 32..126) plus Arial's kerning pairs; Excalidraw's Helvetica is
+    # drawn with Arial on Windows and has the same metrics elsewhere.
+    $ArialAdvance = @(
+        569, 569, 727, 1139, 1139, 1821, 1366, 391, 682, 682, 797, 1196, 569, 682, 569, 569,
+        1139, 1139, 1139, 1139, 1139, 1139, 1139, 1139, 1139, 1139, 569, 569, 1196, 1196, 1196, 1139,
+        2079, 1366, 1366, 1479, 1479, 1366, 1251, 1593, 1479, 569, 1024, 1366, 1139, 1706, 1479, 1593,
+        1366, 1593, 1479, 1366, 1251, 1479, 1366, 1933, 1366, 1366, 1251, 569, 569, 569, 961, 1139,
+        682, 1139, 1139, 1024, 1139, 1139, 569, 1139, 1139, 455, 455, 1024, 455, 1706, 1139, 1139,
+        1139, 1139, 682, 1024, 569, 1139, 1024, 1479, 1024, 1024, 1024, 684, 532, 684, 1196
+    )
+    $ArialDefaultAdvance = 1139
+    $ArialKerning = New-Object 'Collections.Generic.Dictionary[string,int]' ([StringComparer]::Ordinal)
+    foreach ($pair in (@(
+        '11-152 AT-152 AV-152 AW-76 AY-152 Av-37 Aw-37 Ay-37 F,-227 F.-227 FA-113',
+        'LT-152 LV-152 LW-152 LY-152 Ly-76 P,-264 P.-264 PA-152 RT-37 RV-37 RW-37',
+        'RY-37 T,-227 T--113 T.-227 T:-227 T;-227 TA-152 TO-37 Ta-227 Tc-227 Te-227',
+        'Ti-76 To-227 Tr-76 Ts-227 Tu-76 Tw-113 Ty-113 V,-188 V--113 V.-188 V:-76',
+        'V;-76 VA-152 Va-152 Ve-113 Vi-37 Vo-113 Vr-76 Vu-76 Vy-76 W,-113 W--37',
+        'W.-113 W:-37 W;-37 WA-76 Wa-76 We-37 Wo-37 Wr-37 Wu-37 Wy-18 Y,-264',
+        'Y--188 Y.-264 Y:-113 Y;-133 YA-152 Ya-152 Ye-188 Yi-76 Yo-188 Yp-152 Yq-188',
+        'Yu-113 Yv-113 ff-37 r,-113 r.-113 v,-152 v.-152 w,-113 w.-113 y,-152 y.-152'
+    ) -join ' ').Split(' ')) {
+        $ArialKerning[$pair.Substring(0, 2)] = [int]$pair.Substring(2)
+    }
+
     function Get-FirstMatch {
         param([string]$Text, [string]$Pattern, [int]$Group = 1)
         $m = [regex]::Match($Text, $Pattern,
@@ -363,6 +392,52 @@ begin {
         return $result
     }
 
+    function Measure-TextWidth {
+        param([string]$Text, [double]$FontSize)
+        $units = 0
+        for ($i = 0; $i -lt $Text.Length; $i++) {
+            $code = [int]$Text[$i]
+            if ($code -ge 32 -and $code -le 126) { $units += $ArialAdvance[$code - 32] }
+            else { $units += $ArialDefaultAdvance }
+            if ($i -gt 0) {
+                $kern = 0
+                if ($ArialKerning.TryGetValue($Text.Substring($i - 1, 2), [ref]$kern)) { $units += $kern }
+            }
+        }
+        return $units * $FontSize / 2048
+    }
+
+    function Get-WrappedLines {
+        # Breaks at spaces and after hyphens; trailing spaces hang past the column edge; a
+        # word longer than the column is broken between characters (overflow-wrap).
+        param([string]$Text, [double]$MaxWidth, [double]$FontSize)
+        $lines = New-Object 'Collections.Generic.List[string]'
+        $limit = $MaxWidth + 0.01
+        foreach ($paragraph in ($Text -split "\r?\n")) {
+            $line = ''
+            foreach ($m in [regex]::Matches($paragraph, '[^\s-]*-+(?=[^\s-])|\S+|\s+')) {
+                $token = $m.Value
+                if ($token -match '^\s+$') { $line += $token; continue }
+                if ((Measure-TextWidth ($line + $token).TrimEnd() $FontSize) -le $limit) { $line += $token; continue }
+                if ($line.Trim().Length -gt 0) { [void]$lines.Add($line.TrimEnd()); $line = '' }
+                foreach ($ch in $token.ToCharArray()) {
+                    if ($line.Length -gt 0 -and (Measure-TextWidth ($line + $ch) $FontSize) -gt $limit) {
+                        [void]$lines.Add($line); $line = ''
+                    }
+                    $line += $ch
+                }
+            }
+            [void]$lines.Add($line.TrimEnd())
+        }
+        return ,$lines
+    }
+
+    function Get-TextBlockHeight {
+        param([string]$Text, [double]$Width, [double]$FontSize)
+        $count = (Get-WrappedLines $Text $Width $FontSize).Count
+        return [Math]::Max(1, $count) * $FontSize * $TextLineHeight
+    }
+
     function Add-TextElement {
         param(
             [Collections.Generic.List[object]]$Elements, [string]$Text,
@@ -383,9 +458,11 @@ begin {
             $lines = [Math]::Max(1, [Math]::Ceiling($Text.Length / $charsPerLine))
             $Height = $lines * $FontSize * $lineHeight
         }
+        $wrapped = (Get-WrappedLines $Text $Width $FontSize) -join "`n"
+        if ($wrapped.Trim().Length -eq 0) { $wrapped = $Text }   # whitespace-only boxes keep their spaces
         $e = New-BaseElement 'text' $X $Y $Width $Height $Color 'transparent' 'solid' 1
         $e.fontSize = $FontSize; $e.fontFamily = $fontFamily
-        $e.text = $Text; $e.rawText = $Text; $e.originalText = $Text
+        $e.text = $wrapped; $e.rawText = $Text; $e.originalText = $Text
         $e.textAlign = $Align; $e.verticalAlign = 'top'; $e.containerId = $null
         $e.autoResize = $false; $e.lineHeight = $lineHeight; $e.angle = $Angle
         [void]$Elements.Add([pscustomobject]$e)
@@ -744,7 +821,7 @@ begin {
                         $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
                         $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $lw - 26))
                         $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $lh - 26))
-                        $textHeight = [Math]::Min($innerHeight, $fontLocal * $TextLineHeight)
+                        $textHeight = [Math]::Min($innerHeight, (Get-TextBlockHeight $shapeText $innerWidth $fontLocal))
                         $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2)) $innerWidth $textHeight
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
@@ -765,7 +842,7 @@ begin {
                     if ($width -le 0) { $width = Get-CssNumber $textBoxStyle 'max-width' 0 }
                     if ($width -gt 0) { $width = [Math]::Max(1, $width - $PlainTextInsetLeft - $PlainTextInsetRight) }
                     else { $width = [Math]::Max(20, $text.Length * $fontLocal * 0.58) }
-                    $height = [Math]::Max($fontLocal * $TextLineHeight, [Math]::Ceiling(($text.Length * $fontLocal * 0.58) / [Math]::Max(1, $width)) * $fontLocal * $TextLineHeight)
+                    $height = Get-TextBlockHeight $text $width $fontLocal
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
                     $p = Get-BoxPlacement $a $PlainTextInsetLeft ($PlainTextInsetTop + ($TextBaselineShift * $fontLocal)) $width $height
@@ -790,7 +867,7 @@ begin {
                         $e.angle = $p.Angle
                         $e.roundness = @{ type = 3 }; [void]$elements.Add([pscustomobject]$e)
                     }
-                    $p = Get-BoxPlacement $a 12 12 ($lw - 24) ($lh - 24)
+                    $p = Get-BoxPlacement $a 12 12 ($lw - 24) ([Math]::Min($lh - 24, (Get-TextBlockHeight $text ($lw - 24) 20)))
                     Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height (20 * $a.ScaleY) $color 'left' $p.Angle
                 }
                 'Connector' {
