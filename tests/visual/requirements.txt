@@ -1,0 +1,2 @@
+# Visual / geometric checks: tests/visual/run_visual_checks.py
+playwright>=1.44
