@@ -83,7 +83,8 @@ function Get-SourceExpectations {
         switch ($type) {
             'PlainText' {
                 $spans = [regex]::Matches($block, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
-                $t = (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '')
+                # As a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF.
+                $t = (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '') -replace "`r`n?", "`n"
                 if ($t.Trim()) { $texts.Add($t) }
             }
             'Shape' {
@@ -94,7 +95,9 @@ function Get-SourceExpectations {
             'ReactionStickers' { if ($block -match '<img\b[^>]*\bsrc="data:') { $counts.Sticker++ } }
             'Connector' {
                 $counts.Arrowhead += [regex]::Matches($block, '<path\s+d="[^"]+"\s+transform="\s*translate\([^)]*\)\s*,?\s*rotate\(', $RxOpts).Count
-                if ($block -match 'stroke-dasharray') { $counts.DashedConnector++ }
+                # Dashed = a real dash array on the connector's <g> or line; solid double-arrow
+                # connectors carry stroke-dasharray="none" on their arrowhead paths.
+                if ($block -match 'stroke-dasharray="(?!none")[^"]+"') { $counts.DashedConnector++ }
             }
         }
     }
@@ -158,9 +161,15 @@ function Test-Scene {
     $textEls = @($elements | Where-Object { $_.type -eq 'text' })
     $summary.Texts = $textEls.Count
     $outTexts = @($textEls | ForEach-Object { [string]$_.originalText })
+    $brokenBreaks = 0
     foreach ($t in $textEls) {
         if ([string]::IsNullOrEmpty($t.text) -or [string]::IsNullOrEmpty($t.originalText)) { Add-Issue 'FAIL' "text element $($t.id) has empty text/originalText" }
+        # Excalidraw breaks lines only at LF: a CR left in the text is not a line break, and the
+        # wrapped text must keep every line break of the original.
+        elseif ("$($t.text)$($t.originalText)".Contains("`r") -or
+                ([regex]::Matches([string]$t.text, "`n").Count -lt [regex]::Matches([string]$t.originalText, "`n").Count)) { $brokenBreaks++ }
     }
+    if ($brokenBreaks) { Add-Issue 'FAIL' "$brokenBreaks text element(s) lose a line break (raw CR, or fewer lines than the original)" }
     $missing = @($Expect.Texts | Where-Object { $outTexts -notcontains $_ })
     if ($missing.Count) { Add-Issue 'FAIL' ("{0} source text(s) not found verbatim: {1}" -f $missing.Count, (($missing | Select-Object -First 3) -join ' | ')) }
     $qmarks = @($outTexts | Where-Object { $_ -eq '?' }).Count
