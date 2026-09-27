@@ -132,8 +132,10 @@ JS_HTML = r"""() => {
       arrows.push([0, n / 2, n].map(l => { const q = p.getPointAtLength(l); return pt(m, q.x, q.y); }));
     });
   });
-  const all = [...document.querySelectorAll('div.anchor[data-whiteboard-type]')].map(e => e.getBoundingClientRect())
-              .filter(r => r.width > 0 && r.height > 0);
+  // The anchor divs themselves are 0 x 0 (their content overflows them), so take the union
+  // of everything drawn inside them; comment threads are not board objects.
+  const all = [...document.querySelectorAll('div.anchor[data-whiteboard-type]:not([data-whiteboard-type=CommentThread]) *')]
+              .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
   return {cal, texts, stickers, shapes, arrows, notes, bbox};
@@ -200,7 +202,9 @@ JS_SVG = r"""() => [...document.querySelectorAll('foreignObject')].map(fo => {
   const r = rg.getBoundingClientRect(), svg = document.querySelector('svg'), m = svg.getScreenCTM().inverse();
   const P = (x, y) => { const q = svg.createSVGPoint(); q.x = x; q.y = y; return q.matrixTransform(m); };
   const a = P(r.left, r.top), b = P(r.right, r.bottom);
-  return {text: p.textContent, x: a.x, y: a.y, h: b.y - a.y};
+  // Line breaks are <br> elements (Qt collapses raw newlines), which textContent drops.
+  const text = [...p.childNodes].map(n => n.nodeName.toLowerCase() === 'br' ? '\n' : n.textContent).join('');
+  return {text, x: a.x, y: a.y, h: b.y - a.y};
 }).filter(Boolean)"""
 
 

@@ -65,7 +65,11 @@ function Get-SourceExpectations {
     $html = [IO.File]::ReadAllText($HtmlPath, [Text.Encoding]::UTF8)
     $starts = [regex]::Matches($html, '(?=<div\s+class="anchor\b)', 'IgnoreCase')
     $texts = New-Object Collections.Generic.List[string]
-    $counts = @{ Shape = 0; Oval = 0; Sticker = 0; Arrowhead = 0; Rotated = 0; RotatedText = 0 }
+    $counts = @{ Shape = 0; Oval = 0; Sticker = 0; Arrowhead = 0; Rotated = 0; RotatedText = 0; RotatedShape = 0 }
+    # Span text as a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF.
+    $spanText = { param($b)
+        $spans = [regex]::Matches($b, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
+        ((@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '') -replace "`r`n?", "`n") }
     for ($i = 0; $i -lt $starts.Count; $i++) {
         $start = $starts[$i].Index
         $end = if ($i + 1 -lt $starts.Count) { $starts[$i + 1].Index } else { $html.Length }
@@ -77,13 +81,15 @@ function Get-SourceExpectations {
         if ($m.Success) {
             $v = @($m.Groups[1].Value -split '\s*,\s*' | ForEach-Object { [double]::Parse($_, [Globalization.CultureInfo]::InvariantCulture) })
             if ([Math]::Abs($v[1]) -gt 1e-6 -or [Math]::Abs($v[2]) -gt 1e-6 -or $v[0] -lt 0 -or $v[3] -lt 0) {
-                if ($type -eq 'PlainText') { $counts.RotatedText++ } else { $counts.Rotated++ }
+                # PlainText and shapes are drawn rotated (a shape's label turns with it).
+                if ($type -eq 'PlainText') { $counts.RotatedText++ }
+                elseif ($type -eq 'Shape') { $counts.RotatedShape++; if ((& $spanText $block).Trim()) { $counts.RotatedText++ } }
+                else { $counts.Rotated++ }
             }
         }
         switch ($type) {
             'PlainText' {
-                $spans = [regex]::Matches($block, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
-                $t = (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '')
+                $t = & $spanText $block
                 if ($t.Trim()) { $texts.Add($t) }
             }
             'Shape' {
@@ -98,7 +104,8 @@ function Get-SourceExpectations {
         }
     }
     [pscustomobject]@{ Texts = $texts; Shapes = $counts.Shape; Ovals = $counts.Oval; Stickers = $counts.Sticker
-                       Arrowheads = $counts.Arrowhead; RotatedNonText = $counts.Rotated; RotatedText = $counts.RotatedText }
+                       Arrowheads = $counts.Arrowhead; RotatedNonText = $counts.Rotated; RotatedText = $counts.RotatedText
+                       RotatedShapes = $counts.RotatedShape }
 }
 
 # ------------------------------------------------------------------------------------------
@@ -189,6 +196,9 @@ function Test-Ubz {
         $outTexts = New-Object Collections.Generic.List[string]
         foreach ($fo in $svg.SelectNodes('//s:foreignObject', $ns)) {
             $inner = $fo.InnerText   # itemTextContent: the (already XML-decoded) Qt rich-text HTML
+            # Qt collapses raw newlines to spaces, so only <br> counts as a line break; any raw
+            # CR/LF left in the text reads as a space. Line breaks must survive verbatim.
+            $inner = ($inner -replace "[`r`n]+", ' ') -replace '<br\s*/?>', "`n"
             $outTexts.Add([Net.WebUtility]::HtmlDecode(($inner -replace '<[^>]+>', '')))
         }
         $missing = @($Expect.Texts | Where-Object { $outTexts -notcontains $_ })
@@ -226,7 +236,7 @@ function Test-Ubz {
             }
         }
         if ($rotated -ne $Expect.RotatedText) { Add-Issue 'FAIL' "rotated text: export has $($Expect.RotatedText), .ubz has $rotated" }
-        if ($Expect.RotatedNonText -gt 0) { Add-Issue 'WARN' "$($Expect.RotatedNonText) rotated non-text object(s) in the export (drawn unrotated)" }
+        if ($Expect.RotatedNonText -gt 0) { Add-Issue 'WARN' "$($Expect.RotatedNonText) rotated non-shape object(s) in the export (drawn unrotated)" }
 
         # ---- Converter's own counters, when this version reports them ----
         $prop = { param($name) if ($RunResult -and $RunResult.PSObject.Properties[$name]) { $RunResult.$name } else { $null } }
@@ -235,6 +245,12 @@ function Test-Ubz {
             Add-Issue 'FAIL' "shapes: export has $($Expect.Shapes), converter produced $($traced + $fromLabel)"
         }
         if ($fromLabel -gt 0) { Add-Issue 'WARN' "$fromLabel shape(s) built from the label (outline not traceable)" }
+        $rotShapes = & $prop 'RotatedShapesConverted'
+        if ($null -ne $rotShapes -and $rotShapes -ne $Expect.RotatedShapes) {
+            Add-Issue 'FAIL' "rotated shapes: export has $($Expect.RotatedShapes), converter rotated $rotShapes"
+        } elseif ($null -eq $rotShapes -and $Expect.RotatedShapes -gt 0) {
+            Add-Issue 'WARN' "$($Expect.RotatedShapes) rotated shape(s) in the export (this converter version doesn't report rotating them)"
+        }
         $fallback = & $prop 'StickersFallback'
         if ($fallback -gt 0) { Add-Issue 'WARN' "$fallback sticker(s) drawn with a fallback symbol" }
         $unsupported = & $prop 'UnsupportedObjects'
