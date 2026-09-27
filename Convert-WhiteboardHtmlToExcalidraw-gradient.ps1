@@ -74,6 +74,20 @@ begin {
     # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
     $NoteBorder = 1
 
+    # Sticky-note text inset from the note's outer corner (pre-scale px), measured on 12 typed
+    # notes in four real exports: 1px border + 12px ".textBoxCoreWrapper" side padding + Draft.js's
+    # 1px caret gutter on the left, and only the border on top -- the inline "padding: 0px" on
+    # .textBoxCore overrides the stylesheet's 12/16px. The column is the CSS width minus 2 x 12
+    # and the gutter. Note text is 24px (".stickyNote.fixedFontSize") in the note font stack
+    # (Aptos, "Segoe UI", ...), which renders as Segoe UI: line-height normal is (2210 + 514) /
+    # 2048 x font size, with the baseline 2210/2048 below the line top. The note's text element
+    # uses that line height, shifted so its first baseline lands where Whiteboard's does.
+    $NoteTextInsetLeft   = 14
+    $NoteTextInsetTop    = 1
+    $NoteTextColumnInset = 25
+    $NoteLineHeight      = (2210 + 514) / 2048
+    $NoteBaselineShift   = (2210 / 2048) - ((($NoteLineHeight - 1) / 2) + (1577 / 2048))
+
     # Excalidraw draws each text element's "text" exactly as stored, one line per newline:
     # it never re-wraps a free-standing text on load, and it clips whatever overflows the
     # element's width. Whiteboard wraps to the column instead, so the converter breaks the
@@ -238,7 +252,9 @@ begin {
         $values = foreach ($m in $matches) {
             [Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<[^>]+>', ''))
         }
-        return ($values -join '')
+        # Whiteboard stores soft line breaks inside a span as a bare CR or CRLF (the export
+        # keeps them raw); a browser reads both as a newline, so normalise them to LF here.
+        return (($values -join '') -replace "`r`n?", "`n")
     }
 
     function Get-Transform {
@@ -443,13 +459,14 @@ begin {
             [Collections.Generic.List[object]]$Elements, [string]$Text,
             [double]$X, [double]$Y, [double]$Width, [double]$Height,
             [double]$FontSize, [string]$Color, [string]$Align = 'left',
-            [double]$Angle = 0
+            [double]$Angle = 0,
+            [double]$LineHeight = 0   # 0 = $TextLineHeight (Whiteboard's Arial texts)
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
         $Width = Get-ScalarDouble $Width 1; $Height = Get-ScalarDouble $Height 1
         $FontSize = Get-ScalarDouble $FontSize 20
-        $lineHeight = $TextLineHeight
+        $lineHeight = if ($LineHeight -gt 0) { $LineHeight } else { $TextLineHeight }
         $fontFamily = 2 # Helvetica/sans-serif in Excalidraw
         $estimatedWidth = [Math]::Max(1, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
         if ($Width -le 1) { $Width = $estimatedWidth }
@@ -867,8 +884,14 @@ begin {
                         $e.angle = $p.Angle
                         $e.roundness = @{ type = 3 }; [void]$elements.Add([pscustomobject]$e)
                     }
-                    $p = Get-BoxPlacement $a 12 12 ($lw - 24) ([Math]::Min($lh - 24, (Get-TextBlockHeight $text ($lw - 24) 20)))
-                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height (20 * $a.ScaleY) $color 'left' $p.Angle
+                    if ($text.Trim()) {
+                        $noteFont = Get-CssNumber $noteStyle 'font-size' 24
+                        $noteColumn = $lw - $NoteTextColumnInset
+                        $noteLines = (Get-WrappedLines $text $noteColumn $noteFont).Count
+                        $p = Get-BoxPlacement $a $NoteTextInsetLeft ($NoteTextInsetTop + ($NoteBaselineShift * $noteFont)) $noteColumn `
+                            ([Math]::Min($lh - $NoteTextInsetTop - 12, [Math]::Max(1, $noteLines) * $noteFont * $NoteLineHeight))
+                        Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($noteFont * $a.ScaleY) $color 'left' $p.Angle -LineHeight $NoteLineHeight
+                    }
                 }
                 'Connector' {
                     $svgTag = Get-FirstMatch $block '(<svg\b[^>]*>)'
