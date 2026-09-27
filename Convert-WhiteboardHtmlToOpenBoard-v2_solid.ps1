@@ -327,7 +327,7 @@ begin {
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
         $Width = Get-ScalarDouble $Width 1; $Height = Get-ScalarDouble $Height 1
         $FontSize = Get-ScalarDouble $FontSize 20
-        $estimatedWidth = [Math]::Max(1, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
+        $estimatedWidth = [Math]::Max(1.0, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
         if ($Width -le 1) { $Width = $estimatedWidth }
         if ($Height -le 1) { $Height = (Get-TextLineCount $Text $Width $FontSize) * $FontSize * 1.25 }
         [void]$Graphics.Add([pscustomobject]@{
@@ -685,7 +685,7 @@ begin {
         )
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
         $Width = Get-ScalarDouble $Width 40; $Height = Get-ScalarDouble $Height 40
-        $size = [Math]::Max(16, [Math]::Min($Width, $Height))
+        $size = [Math]::Max(16.0, [Math]::Min($Width, $Height))
 
         if ($Label -match 'red cross') {
             Add-UbzLine $Graphics $X $Y ($X + $size) ($Y + $size) '#e62e55' 4
@@ -820,7 +820,7 @@ begin {
                 }
                 'Image' {
                     $sx = ($g.X - $centerX).ToString($ci); $sy = ($g.Y - $centerY).ToString($ci)
-                    $nw = [Math]::Max(1, $g.NativeWidth); $nh = [Math]::Max(1, $g.NativeHeight)
+                    $nw = [Math]::Max(1.0, $g.NativeWidth); $nh = [Math]::Max(1.0, $g.NativeHeight)
                     $scaleX = ($g.Width / $nw).ToString($ci); $scaleY = ($g.Height / $nh).ToString($ci)
                     [void]$sb.Append('  <image')
                     [void]$sb.Append((' xlink:href="images/{0}"' -f $g.File))
@@ -1001,8 +1001,8 @@ begin {
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                         $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
-                        $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $lw - 26))
-                        $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $lh - 26))
+                        $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1.0, $lw - 26))
+                        $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1.0, $lh - 26))
                         $textHeight = [Math]::Min($innerHeight, $fontLocal * 1.25 * (Get-TextLineCount $shapeText $innerWidth $fontLocal))
                         $origin = ConvertTo-BoardPoints $a @(,[double[]]@(($u0 + (($lw - $innerWidth) / 2)), ($v0 + (($lh - $textHeight) / 2))))
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
@@ -1031,8 +1031,8 @@ begin {
                     $insetLeft = $PlainTextInsetLeft; $insetRight = $PlainTextInsetRight; $insetTop = $PlainTextInsetTop
                     $width = Get-CssNumber $outerStyle 'width' 0
                     if ($width -le 0) { $width = Get-CssNumber $textBoxStyle 'max-width' 0 }
-                    if ($width -gt 0) { $width = [Math]::Max(1, $width - $insetLeft - $insetRight) }
-                    else { $width = [Math]::Max(20, $text.Length * $font * 0.58 / $a.ScaleX) }
+                    if ($width -gt 0) { $width = [Math]::Max(1.0, $width - $insetLeft - $insetRight) }
+                    else { $width = [Math]::Max(20.0, $text.Length * $font * 0.58 / $a.ScaleX) }
                     $width *= $a.ScaleX
                     $height = (Get-TextLineCount $text $width $font) * $font * 1.25
                     $weight = Get-FontWeight $coreStyle 400
