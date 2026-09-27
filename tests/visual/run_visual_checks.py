@@ -8,7 +8,9 @@ For every sample export and both converter scripts this:
   2. renders the Whiteboard HTML in headless Chromium and measures where Whiteboard really
      puts every text, sticker, note, image, shape outline, connector and arrowhead;
   3. reads the .excalidraw scene and places the same things the way Excalidraw does (text
-     is laid out in Chromium with Excalidraw's font size, line height, width and alignment);
+     is laid out in Chromium with Excalidraw's font size, line height, width and alignment,
+     and -- like Excalidraw -- never re-wrapped: a line wider than its element is clipped in
+     Excalidraw, so it fails the check);
   4. writes tests/out/visual/results.json and exits non-zero if any tolerance is exceeded.
 
 Only dependency: Playwright (pip install playwright; python -m playwright install chromium).
@@ -38,6 +40,7 @@ VERSIONS = ("solid", "gradient")
 # Pass/fail tolerances in board pixels.
 TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "image": 0.5, "shape": 1.5, "connector": 0.5, "arrow": 0.5}
 ARROW_ANGLE_TOL = 2.0   # degrees between Whiteboard's chevron axis and the arrow's end segment
+TEXT_CLIP_TOL = 1.0     # px a text line may extend past its element's width before Excalidraw clips it
 
 
 # ----------------------------------------------------------------------------------------
@@ -106,10 +109,21 @@ JS_HTML = r"""() => {
     const spans = [...a.querySelectorAll('span[data-text="true"]')];
     const t = spans.map(s => s.textContent).join('');
     if (t.trim()) {
-      const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
-      rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
-      const b = rg.getBoundingClientRect();
-      texts.push({type, text: t, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height});
+      // Union of the visible characters' boxes. A range over the whole text would include the
+      // spaces pre-wrap keeps at the end of a wrapped line; they hang past the column and are
+      // not used for alignment, so they would shift centred or right-aligned text.
+      const rg = document.createRange(); let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      spans.forEach(s => {
+        const w = document.createTreeWalker(s, NodeFilter.SHOW_TEXT); let n;
+        while ((n = w.nextNode())) for (let i = 0; i < n.length; i++) {
+          if (/\s/.test(n.data[i])) continue;
+          rg.setStart(n, i); rg.setEnd(n, i + 1);
+          for (const c of rg.getClientRects()) {
+            x0 = Math.min(x0, c.left); y0 = Math.min(y0, c.top); x1 = Math.max(x1, c.right); y1 = Math.max(y1, c.bottom);
+          }
+        }
+      });
+      texts.push({type, text: t, x: x0 + scrollX, y: y0 + scrollY, w: x1 - x0, h: y1 - y0});
     }
     if (type === 'ReactionStickers') stickers.push(box(a.querySelector('img').getBoundingClientRect()));
     if (type === 'Image' || type === 'AzureImage') images.push(box(a.querySelector('img').getBoundingClientRect()));
@@ -193,14 +207,17 @@ JS_TEXT = r"""(els) => {
     const exBase = (lh - e.fontSize * (e.asc - e.desc) / e.upem) / 2 + e.fontSize * e.asc / e.upem;
     const d = document.createElement('div');
     d.style.cssText = `position:absolute;left:${e.x}px;top:${e.y}px;width:${e.width}px;font-size:${e.fontSize}px;` +
-      `font-family:${e.font};line-height:${lh}px;text-align:${e.textAlign};white-space:pre-wrap;` +
-      `overflow-wrap:break-word;transform-origin:center;` +
+      `font-family:${e.font};line-height:${lh}px;text-align:${e.textAlign};white-space:pre;` +
+      `transform-origin:center;` +
       `transform:rotate(${e.angle || 0}rad) translateY(${exBase - cssBase}px);margin:0;padding:0`;
     d.textContent = e.text; document.body.appendChild(d);
     const rg = document.createRange(); rg.selectNodeContents(d);
     const b = rg.getBoundingClientRect();
+    // Excalidraw draws "text" line by line with fillText and never re-wraps it: anything
+    // past the element's width is clipped.
+    const widest = Math.max(...e.text.split('\n').map(l => ctx.measureText(l.trimEnd()).width));
     return {text: e.originalText, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height,
-            align: e.textAlign, angle: e.angle || 0};
+            align: e.textAlign, angle: e.angle || 0, overflow: widest - e.width};
   });
 }"""
 
@@ -345,7 +362,9 @@ def compare(src: dict, out: dict) -> dict:
     errs = [r["err"] for r in rows if "err" in r]
     res["text"] = {"expected": len(src["texts"]), "matched": len(errs),
                    "median": round(sorted(errs)[len(errs) // 2], 1) if errs else None,
-                   "max": max(errs) if errs else None, "rows": rows}
+                   "max": max(errs) if errs else None, "rows": rows,
+                   "clipped": [{"text": t["text"][:50], "overflow": round(t["overflow"], 1)}
+                               for t in out["texts"] if t["overflow"] > TEXT_CLIP_TOL]}
     for k in ("sticker", "note", "image"):
         e = nearest_boxes(src[k + "s"], out[k + "s"])
         res[k] = {"expected": len(src[k + "s"]), "matched": len(out[k + "s"]), "max": round(max(e), 2) if e else None}
@@ -390,6 +409,7 @@ def compare(src: dict, out: dict) -> dict:
     fails = []
     if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
     if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
+    if res["text"]["clipped"]: fails.append(f"{len(res['text']['clipped'])} text(s) wider than their element (clipped in Excalidraw)")
     for k in ("sticker", "note", "image", "shape", "connector", "arrow"):
         if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
         if k == "shape":
