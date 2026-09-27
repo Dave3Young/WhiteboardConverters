@@ -96,6 +96,15 @@ begin {
     # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
     $NoteBorder = 1
 
+    # Sticky-note text inset from the note's outer corner (pre-scale px), measured on 12 typed
+    # notes in four real exports: 1px border + 12px ".textBoxCoreWrapper" side padding + Draft.js's
+    # 1px caret gutter on the left, and only the border on top -- the inline "padding: 0px" on
+    # .textBoxCore overrides the stylesheet's 12/16px. The column is the CSS width minus 2 x 12
+    # and the gutter. Note text is 24px (".stickyNote.fixedFontSize") and bold.
+    $NoteTextInsetLeft = 14
+    $NoteTextInsetTop  = 1
+    $NoteTextColumnInset = 25
+
     # ===================================================================================
     # Parsing helpers -- verbatim from Convert-WhiteboardHtmlToExcalidraw-v3_gradient_c.ps1
     # ===================================================================================
@@ -201,7 +210,9 @@ begin {
         $values = foreach ($m in $matches) {
             [Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<[^>]+>', ''))
         }
-        return ($values -join '')
+        # Whiteboard stores soft line breaks inside a span as a bare CR or CRLF (the export
+        # keeps them raw); a browser reads both as a newline, so normalise them to LF here.
+        return (($values -join '') -replace "`r`n?", "`n")
     }
 
     function Get-Transform {
@@ -342,7 +353,10 @@ begin {
             [double]$FontSize, [string]$Color, [string]$Align = 'left',
             # Optional unit rotation (no scale) for rotated text: the box's local x axis is
             # (M11, M12) and its local y axis is (M21, M22), in SVG matrix order.
-            [double]$M11 = 1, [double]$M12 = 0, [double]$M21 = 0, [double]$M22 = 1
+            [double]$M11 = 1, [double]$M12 = 0, [double]$M21 = 0, [double]$M22 = 1,
+            # CSS font-weight of the source text (Whiteboard headings are 600, note text 700).
+            # Dropping it drew them narrower, which moved centred and right-aligned lines.
+            [int]$Weight = 400
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
@@ -350,16 +364,31 @@ begin {
         $FontSize = Get-ScalarDouble $FontSize 20
         $estimatedWidth = [Math]::Max(1, [Math]::Min($Width, $Text.Length * $FontSize * 0.58))
         if ($Width -le 1) { $Width = $estimatedWidth }
-        if ($Height -le 1) {
-            $charsPerLine = [Math]::Max(1, [Math]::Floor($Width / ($FontSize * 0.58)))
-            $lines = [Math]::Max(1, [Math]::Ceiling($Text.Length / $charsPerLine))
-            $Height = $lines * $FontSize * 1.25
-        }
+        if ($Height -le 1) { $Height = (Get-TextLineCount $Text $Width $FontSize) * $FontSize * 1.25 }
         [void]$Graphics.Add([pscustomobject]@{
             Kind = 'Text'; X = $X; Y = $Y; Width = $Width; Height = $Height
-            FontSize = $FontSize; Color = $Color; Align = $Align; Family = 'Arial'
+            FontSize = $FontSize; Color = $Color; Align = $Align; Family = 'Arial'; Weight = $Weight
             Text = $Text; M11 = $M11; M12 = $M12; M21 = $M21; M22 = $M22
         })
+    }
+
+    function Get-TextLineCount {
+        # Rough line count for sizing a text box: each paragraph wraps on its own.
+        param([string]$Text, [double]$Width, [double]$FontSize)
+        $charsPerLine = [Math]::Max(1, [Math]::Floor($Width / ($FontSize * 0.58)))
+        $count = 0
+        foreach ($paragraph in ($Text -split "`n")) { $count += [Math]::Max(1, [Math]::Ceiling($paragraph.Length / $charsPerLine)) }
+        return [Math]::Max(1, $count)
+    }
+
+    function Get-FontWeight {
+        # CSS font-weight from an inline style: numbers as-is, normal/bold as 400/700.
+        param([string]$Style, [int]$Default = 400)
+        $v = "$(Get-StyleValue $Style 'font-weight')".Trim()
+        if ($v -match '^\d+$') { return [int]$v }
+        if ($v -eq 'bold') { return 700 }
+        if ($v -eq 'normal') { return 400 }
+        return $Default
     }
 
     function Add-UbzFilledPolygon {
@@ -405,6 +434,18 @@ begin {
             Kind = 'Line'; X1 = $X1; Y1 = $Y1; X2 = $X2; Y2 = $Y2
             Stroke = $Stroke; StrokeWidth = $StrokeWidth; ParentGroup = $ParentGroup
         })
+    }
+
+    function ConvertTo-BoardPoints {
+        # Maps points in an anchor's local (pre-transform) px through its full CSS matrix
+        # (transform-origin 0 0), so rotated and mirrored objects keep their orientation.
+        param($Anchor, [double[][]]$Points)
+        $out = New-Object Collections.Generic.List[double[]]
+        foreach ($p in $Points) {
+            [void]$out.Add([double[]]@(($Anchor.X + ($Anchor.MA * $p[0]) + ($Anchor.MC * $p[1])),
+                                       ($Anchor.Y + ($Anchor.MB * $p[0]) + ($Anchor.MD * $p[1]))))
+        }
+        return ,($out.ToArray())
     }
 
     function Get-RectPoints { param($X, $Y, $W, $H)
@@ -819,9 +860,10 @@ begin {
                 'Text' {
                     $sx = ($g.X - $centerX).ToString($ci); $sy = ($g.Y - $centerY).ToString($ci)
                     $w = $g.Width.ToString($ci); $h = $g.Height.ToString($ci); $fs = $g.FontSize.ToString($ci)
-                    $safe = ConvertTo-XmlText $g.Text
-                    $html = '<p style="margin:0px; text-align:{4}; font-family:''{0}''; font-size:{1}px; color:{2};">{3}</p>' -f `
-                        $g.Family, $fs, $g.Color, $safe, $g.Align
+                    # Qt rich text collapses raw newlines to spaces, so line breaks become <br />.
+                    $safe = (ConvertTo-XmlText $g.Text).Replace("`n", '<br />')
+                    $html = '<p style="margin:0px; text-align:{4}; font-family:''{0}''; font-size:{1}px; font-weight:{5}; color:{2};">{3}</p>' -f `
+                        $g.Family, $fs, $g.Color, $safe, $g.Align, $g.Weight
                     $innerEscaped = ConvertTo-XmlText $html
                     $colorDark = if ((Get-Luminance $g.Color) -lt 128) { '#ffffff' } else { $g.Color }
                     [void]$sb.Append('  <foreignObject ub:type="text"')
@@ -970,7 +1012,7 @@ begin {
         $dashedCount = 0
         $stickerImageCount = 0; $stickerFallbackCount = 0
         $shapeTracedCount = 0; $shapeFallbackCount = 0
-        $rotatedTextCount = 0; $rotationIgnored = [Collections.Generic.List[string]]::new()
+        $rotatedTextCount = 0; $rotatedShapeCount = 0; $rotationIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
 
         foreach ($block in $blocks) {
@@ -978,51 +1020,59 @@ begin {
             if (-not $a.Type) { continue }
             if (-not $sourceTypes.ContainsKey($a.Type)) { $sourceTypes[$a.Type] = 0 }
             $sourceTypes[$a.Type]++
-            # Only PlainText is rotated natively so far; other rotated objects keep their
-            # correct size but are drawn unrotated -- counted so the summary can say so.
-            if ($a.IsRotated -and $a.Type -ne 'PlainText') { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
+            # PlainText is rotated natively and shapes are traced through the full matrix; other
+            # rotated objects keep their correct size but are drawn unrotated -- counted so the
+            # summary can say so.
+            if ($a.IsRotated -and $a.Type -eq 'Shape') { $rotatedShapeCount++ }
+            elseif ($a.IsRotated -and $a.Type -ne 'PlainText') { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
 
             switch ($a.Type) {
                 'Shape' {
                     $svgTag = Get-FirstMatch $block '(<svg\b[^>]*\bclass="[^"]*\bshape\b[^"]*"[^>]*>)'
                     if (-not $svgTag) { $svgTag = Get-FirstMatch $block '(<svg\b[^>]*>)' }
-                    $w = (Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') 100) * $a.ScaleX
-                    $h = (Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') 100) * $a.ScaleY
+                    # Everything below is in the anchor's local (pre-transform) px; the outline is
+                    # then mapped through the anchor's full matrix. Scaling only the points drew
+                    # rotated shapes unrotated -- 180-degree block arrows pointed the wrong way.
+                    $lw = Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') 100
+                    $lh = Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') 100
+                    $u0 = 0.0; $v0 = 0.0
+                    if ($a.IsCentered) { $u0 = -$lw / 2; $v0 = -$lh / 2 }
                     $gTag = Get-FirstMatch $block '(<g\b[^>]*>)'
                     $fill = Convert-RgbaToHex (Get-FirstMatch $gTag '\bfill="([^"]+)"') '#ffffff' -TransparentAllowed
                     $stroke = Convert-RgbaToHex (Get-FirstMatch $gTag '\bstroke="([^"]+)"') '#1f1f1f' -TransparentAllowed
                     $dash = Get-FirstMatch $gTag '\bstroke-dasharray="([^"]+)"'
                     if ($dash) { $dashedCount++ }   # OpenBoard ink strokes have no dash style; drawn solid
-                    $x = $a.X; $y = $a.Y
-                    if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
                     $shapeName = Get-FirstMatch $svgTag 'aria-label="\s*([^,."]+)'
                     # Prefer Whiteboard's own outline path (exact geometry for any shape);
                     # fall back to the aria-label only when the path can't be traced.
                     # Whiteboard labels circles/ellipses "oval" -- previously unmatched here,
                     # which turned every oval into a rectangle.
-                    $points = Get-ShapePathPoints $block $x $y $a.ScaleX $a.ScaleY
-                    if ($null -ne $points) { $shapeTracedCount++ }
+                    $local = Get-ShapePathPoints $block $u0 $v0 1 1
+                    if ($null -ne $local) { $shapeTracedCount++ }
                     else {
                         $shapeFallbackCount++
-                        $points = if ($shapeName -match 'ellipse|circle|oval') { Get-EllipsePoints $x $y $w $h }
-                                  elseif ($shapeName -match 'diamond') { Get-DiamondPoints $x $y $w $h }
-                                  else { Get-RectPoints $x $y $w $h }
+                        $local = if ($shapeName -match 'ellipse|circle|oval') { Get-EllipsePoints $u0 $v0 $lw $lh }
+                                 elseif ($shapeName -match 'diamond') { Get-DiamondPoints $u0 $v0 $lw $lh }
+                                 else { Get-RectPoints $u0 $v0 $lw $lh }
                     }
-                    Add-UbzShape $graphics $points $fill $stroke 2
+                    Add-UbzShape $graphics (ConvertTo-BoardPoints $a $local) $fill $stroke 2
 
                     $shapeText = Get-HtmlText $block
                     if (-not [string]::IsNullOrEmpty($shapeText)) {
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
-                        $font = (Get-CssNumber $shapeTextStyle 'font-size' 20) * $a.ScaleY
-                        $innerWidth = (Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $w - 26))) * $a.ScaleX
-                        $innerHeight = (Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $h - 26))) * $a.ScaleY
-                        $textHeight = [Math]::Min($innerHeight, $font * 1.25)
-                        $textX = $x + (($w - $innerWidth) / 2)
-                        $textY = $y + (($h - $textHeight) / 2)
+                        $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
+                        $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1, $lw - 26))
+                        $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1, $lh - 26))
+                        $textHeight = [Math]::Min($innerHeight, $fontLocal * 1.25 * (Get-TextLineCount $shapeText $innerWidth $fontLocal))
+                        $origin = ConvertTo-BoardPoints $a @(,[double[]]@(($u0 + (($lw - $innerWidth) / 2)), ($v0 + (($lh - $textHeight) / 2))))
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
-                        Add-UbzText $graphics $shapeText $textX $textY $innerWidth $textHeight $font $textColor $textAlign
+                        # The text box turns with the shape (unit rotation, as for rotated PlainText).
+                        Add-UbzText $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) ($textHeight * $a.ScaleY) `
+                            ($fontLocal * $a.ScaleY) $textColor $textAlign `
+                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight (Get-FontWeight $shapeCoreStyle 700)
+                        if ($a.IsRotated) { $rotatedTextCount++ }
                     }
                 }
                 'PlainText' {
@@ -1045,7 +1095,8 @@ begin {
                     if ($width -gt 0) { $width = [Math]::Max(1, $width - $insetLeft - $insetRight) }
                     else { $width = [Math]::Max(20, $text.Length * $font * 0.58 / $a.ScaleX) }
                     $width *= $a.ScaleX
-                    $height = [Math]::Max($font * 1.25, [Math]::Ceiling(($text.Length * $font * 0.58) / [Math]::Max(1, $width)) * $font * 1.25)
+                    $height = (Get-TextLineCount $text $width $font) * $font * 1.25
+                    $weight = Get-FontWeight $coreStyle 400
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
                     # Text origin = anchor + matrix * (insetLeft, insetTop). With no rotation this
@@ -1055,9 +1106,9 @@ begin {
                     if ($a.IsRotated) {
                         $rotatedTextCount++
                         Add-UbzText $graphics $text $textX $textY $width $height $font $color $align `
-                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY)
+                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight
                     } else {
-                        Add-UbzText $graphics $text $textX $textY $width $height $font $color $align
+                        Add-UbzText $graphics $text $textX $textY $width $height $font $color $align -Weight $weight
                     }
                 }
                 'Note' {
@@ -1075,7 +1126,13 @@ begin {
                     } else {
                         Add-UbzFilledPolygon $graphics (Get-RectPoints $a.X $a.Y $w $h) $bg 1.0
                     }
-                    Add-UbzText $graphics $text ($a.X + 12) ($a.Y + 12) ($w - 24) ($h - 24) (20 * $a.ScaleY) $color 'left'
+                    if ($text.Trim()) {
+                        $noteFont = Get-CssNumber $noteStyle 'font-size' 24
+                        Add-UbzText $graphics $text ($a.X + ($NoteTextInsetLeft * $a.ScaleX)) ($a.Y + ($NoteTextInsetTop * $a.ScaleY)) `
+                            (((Get-CssNumber $noteStyle 'width' 304) - $NoteTextColumnInset) * $a.ScaleX) `
+                            (((Get-CssNumber $noteStyle 'height' 304) - $NoteTextInsetTop - 12) * $a.ScaleY) `
+                            ($noteFont * $a.ScaleY) $color 'left' -Weight (Get-FontWeight $coreStyle 700)
+                    }
                 }
                 'Connector' {
                     $svgTag = Get-FirstMatch $block '(<svg\b[^>]*>)'
@@ -1200,7 +1257,7 @@ begin {
             DashedStrokesFlattened=$dashedCount
             StickersEmbedded=$stickerImageCount; StickersFallback=$stickerFallbackCount
             ShapesTraced=$shapeTracedCount; ShapesFromLabel=$shapeFallbackCount
-            RotatedTextConverted=$rotatedTextCount; RotationIgnored=$rotationIgnored.Count
+            RotatedTextConverted=$rotatedTextCount; RotatedShapesConverted=$rotatedShapeCount; RotationIgnored=$rotationIgnored.Count
             ArrowheadsConverted=$arrowheadCount
             RotationIgnoredDetails=@($rotationIgnored)
         }
@@ -1232,6 +1289,9 @@ process {
         }
         if ($result.RotatedTextConverted -gt 0) {
             Write-Host ("  {0} rotated text box(es) converted with their rotation." -f $result.RotatedTextConverted)
+        }
+        if ($result.RotatedShapesConverted -gt 0) {
+            Write-Host ("  {0} rotated shape(s) converted with their rotation." -f $result.RotatedShapesConverted)
         }
         if ($result.RotationIgnored -gt 0) {
             Write-Warning ("{0} rotated non-text object(s) were drawn unrotated (correct size): {1}" -f `
