@@ -55,7 +55,10 @@ The run summary reports every item below when it occurs.
 - **Mirrored objects** are drawn unmirrored, because Excalidraw can't mirror.
 - **Stickers without artwork** are drawn as a fallback symbol.
 - **Untraceable shapes:** a shape whose outline can't be traced is built from its label.
-- **Font:** text uses Excalidraw's Helvetica, and underline is dropped.
+- **Font:** text uses Excalidraw's Helvetica, and bold is dropped.
+- **Underline:** Excalidraw text can't be underlined, so a line is drawn under each line of
+  underlined text and grouped with it. If you edit the text, the line doesn't follow the new
+  wording.
 
 ## Tests
 ```powershell

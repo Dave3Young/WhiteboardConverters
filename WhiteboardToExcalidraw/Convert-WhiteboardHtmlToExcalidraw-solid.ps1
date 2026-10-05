@@ -65,6 +65,11 @@ begin {
     $TextLineHeight    = 1.15
     $TextBaselineShift = (1854 / 2048) - ((($TextLineHeight - 1) / 2) + (1577 / 2048))
 
+    # Underlines (drawn as lines, see Add-Underlines): centre below the baseline and thickness,
+    # in font sizes, as Chromium draws Arial's.
+    $UnderlineOffset    = 217 / 2048
+    $UnderlineThickness = 0.08
+
     # ".stickyNote { border-width: 1px }" sits outside the note's CSS width/height, and the
     # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
     $NoteBorder = 1
@@ -409,7 +414,8 @@ begin {
             [double]$X, [double]$Y, [double]$Width, [double]$Height,
             [double]$FontSize, [string]$Color, [string]$Align = 'left',
             [double]$Angle = 0,
-            [double]$LineHeight = 0   # 0 = $TextLineHeight (Whiteboard's Arial texts)
+            [double]$LineHeight = 0,  # 0 = $TextLineHeight (Whiteboard's Arial texts)
+            [bool]$Underline = $false
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
@@ -445,7 +451,46 @@ begin {
         $e.text = $wrapped; $e.rawText = $Text; $e.originalText = $Text
         $e.textAlign = $Align; $e.verticalAlign = 'top'; $e.containerId = $null
         $e.autoResize = $false; $e.lineHeight = $lineHeight; $e.angle = $Angle
+        if ($Underline) { Add-Underlines $Elements $e $wrapped $Align }   # sets $e.groupIds, so first
         [void]$Elements.Add([pscustomobject]$e)
+    }
+
+    function Test-Underline {
+        # Whiteboard underlines a whole text box with text-decoration on its textBoxCore div.
+        param([string]$Style)
+        return "$(Get-StyleValue $Style 'text-decoration')" -match '\bunderline\b'
+    }
+
+    function Add-Underlines {
+        # Excalidraw text has no underline, so each wrapped line gets a drawn one, grouped with
+        # the text so they move together. Chromium centres Arial's underline 217/2048 x font size
+        # below the baseline ($UnderlineOffset); the first baseline sits where the comment on
+        # $TextBaselineShift says. Each line is placed in the text's own frame and turned about
+        # the text's centre, so rotated text keeps its underline. customData marks the lines so
+        # the visual checks don't count them as connectors.
+        param([Collections.Generic.List[object]]$Elements, $Text, [string]$Wrapped, [string]$Align)
+        $fs = [double]$Text.fontSize; $lh = [double]$Text.lineHeight
+        $groupId = New-Id
+        $Text.groupIds = @($groupId)
+        $cos = [Math]::Cos($Text.angle); $sin = [Math]::Sin($Text.angle)
+        $cx = $Text.x + ($Text.width / 2); $cy = $Text.y + ($Text.height / 2)
+        $lines = @($Wrapped -split "`n")
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $w = Measure-TextWidth $lines[$i].TrimEnd() $fs
+            if ($w -le 0) { continue }
+            $left = switch ($Align) { 'center' { ($Text.width - $w) / 2 } 'right' { $Text.width - $w } default { 0.0 } }
+            $ly = (((($lh - 1) / 2) + (1577 / 2048)) * $fs) + ($i * $lh * $fs) + ($UnderlineOffset * $fs)
+            $dx = $left + ($w / 2) - ($Text.width / 2); $dy = $ly - ($Text.height / 2)
+            $mx = $cx + ($dx * $cos) - ($dy * $sin); $my = $cy + ($dx * $sin) + ($dy * $cos)
+            $u = New-BaseElement 'line' ($mx - ($w / 2)) $my $w 0 $Text.strokeColor
+            $u.height = 0; $u.strokeWidth = [Math]::Max(1.0, $fs * $UnderlineThickness); $u.angle = $Text.angle
+            $pointList = New-Object Collections.ArrayList
+            [void]$pointList.Add([double[]]@(0, 0)); [void]$pointList.Add([double[]]@($w, 0))
+            $u.groupIds = @($groupId); $u.points = $pointList
+            $u.lastCommittedPoint = $null; $u.startBinding = $null; $u.endBinding = $null
+            $u.startArrowhead = $null; $u.endArrowhead = $null; $u.customData = @{ underline = $true }
+            [void]$Elements.Add([pscustomobject]$u)
+        }
     }
 
     function Add-ReactionSticker {
@@ -723,7 +768,7 @@ begin {
         $imageOutputDir = Join-Path (Split-Path -Parent $DestinationPath) "${destBaseName}_images"
         $stickerImageCount = 0; $stickerFallbackCount = 0
         $shapeTracedCount = 0; $shapeFallbackCount = 0
-        $rotatedCount = 0; $mirrorIgnored = [Collections.Generic.List[string]]::new()
+        $rotatedCount = 0; $underlinedCount = 0; $mirrorIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
 
         foreach ($block in $blocks) {
@@ -820,7 +865,9 @@ begin {
                         $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2)) $innerWidth $textHeight
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
-                        Add-TextElement $elements $shapeText $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $textColor $textAlign $p.Angle
+                        $underline = Test-Underline $shapeCoreStyle
+                        if ($underline) { $underlinedCount++ }
+                        Add-TextElement $elements $shapeText $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $textColor $textAlign $p.Angle -Underline $underline
                     }
                 }
                 'PlainText' {
@@ -841,7 +888,9 @@ begin {
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
                     $p = Get-BoxPlacement $a $PlainTextInsetLeft ($PlainTextInsetTop + ($TextBaselineShift * $fontLocal)) $width $height
-                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $color $align $p.Angle
+                    $underline = Test-Underline $coreStyle
+                    if ($underline -and $text.Trim()) { $underlinedCount++ }
+                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $color $align $p.Angle -Underline $underline
                 }
                 'Note' {
                     $text = Get-HtmlText $block
@@ -863,7 +912,9 @@ begin {
                         $noteLines = (Get-WrappedLines $text $noteColumn $noteFont).Count
                         $p = Get-BoxPlacement $a $NoteTextInsetLeft ($NoteTextInsetTop + ($NoteBaselineShift * $noteFont)) $noteColumn `
                             ([Math]::Min($lh - $NoteTextInsetTop - 12, [Math]::Max(1, $noteLines) * $noteFont * $NoteLineHeight))
-                        Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($noteFont * $a.ScaleY) $color 'left' $p.Angle -LineHeight $NoteLineHeight
+                        $underline = Test-Underline $coreStyle
+                        if ($underline) { $underlinedCount++ }
+                        Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($noteFont * $a.ScaleY) $color 'left' $p.Angle -LineHeight $NoteLineHeight -Underline $underline
                     }
                 }
                 'Connector' {
@@ -1027,6 +1078,7 @@ begin {
             StickersEmbedded=$stickerImageCount; StickersFallback=$stickerFallbackCount
             ShapesTraced=$shapeTracedCount; ShapesFromLabel=$shapeFallbackCount
             RotatedObjects=$rotatedCount; ArrowheadsConverted=$arrowheadCount
+            UnderlinedTexts=$underlinedCount
             MirrorIgnored=$mirrorIgnored.Count; MirrorIgnoredDetails=@($mirrorIgnored)
         }
     }
@@ -1054,6 +1106,9 @@ process {
         if ($result.ImageFiles.Count -gt 0) {
             Write-Host ("  Also wrote {0} standalone image file(s) to: {1}" -f `
                 $result.ImageFiles.Count, (Split-Path -Parent $result.ImageFiles[0]))
+        }
+        if ($result.UnderlinedTexts -gt 0) {
+            Write-Host ("  {0} underlined text(s) were given a drawn underline (Excalidraw text has no underline)." -f $result.UnderlinedTexts)
         }
         if ($result.StickersFallback -gt 0) {
             Write-Warning ("{0} reaction sticker(s) had no embedded artwork and were drawn with a fallback symbol." -f $result.StickersFallback)

@@ -311,7 +311,9 @@ def measure_scene(page, scene_path: Path, off) -> dict:
         x1 = max(b[0] + b[2] for b in g); y1 = max(b[1] + b[3] - 0.15 for b in g)   # minus the band overlap
         notes.append((x0, y0, x1 - x0, y1 - y0))
 
-    linear = [e for e in els if e["type"] in ("line", "arrow") and not e.get("polygon")]
+    # Drawn underlines are lines too, marked with customData; they aren't connectors.
+    linear = [e for e in els if e["type"] in ("line", "arrow") and not e.get("polygon")
+              and not (e.get("customData") or {}).get("underline")]
     conns, arrows = [], []
     for e in linear:
         pts = [(e["x"] + off[0] + p[0], e["y"] + off[1] + p[1]) for p in e["points"]]
