@@ -65,4 +65,3 @@ The run summary reports every item below when it occurs.
 - **Visual tests:** they measure the original board in headless Chromium and compare every
   text, note, shape, sticker and arrowhead position with the converted file. The report is
   written to `tests\out\visual\report.html`.
-- **Format notes:** [CLAUDE.md](CLAUDE.md) documents both file formats in detail.

@@ -74,5 +74,3 @@ The run summary reports these when they occur.
 - **Samples:** `samples\` holds 59 real Whiteboard exports.
 - **Output:** converted files are written to `tests\out\solid` and `tests\out\gradient`.
 - **Visual tests:** the report is written to `tests\out\visual\report.html`.
-- **Format notes:** [CLAUDE.md](CLAUDE.md) documents the IWB format and OpenBoard's importer
-  quirks in detail.
