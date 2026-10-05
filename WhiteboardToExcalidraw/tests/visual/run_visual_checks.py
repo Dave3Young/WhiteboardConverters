@@ -11,10 +11,14 @@ For every sample export and both converter scripts this:
      is laid out in Chromium with Excalidraw's font size, line height, width and alignment,
      and -- like Excalidraw -- never re-wrapped: a line wider than its element is clipped in
      Excalidraw, so it fails the check);
-  4. writes tests/out/visual/results.json and exits non-zero if any tolerance is exceeded.
+  4. draws the scene with Excalidraw's own exporter, for the report only;
+  5. writes tests/out/visual/report.html (side-by-side pictures + accuracy tables) and
+     results.json, and exits non-zero if any tolerance is exceeded.
 
-Only dependency: Playwright (pip install playwright; python -m playwright install chromium).
-Run tests/Setup-VisualTests.ps1 once to set that up in tests/.venv.
+Dependencies: Playwright (pip install playwright; python -m playwright install chromium), and
+for the Excalidraw pictures @excalidraw/utils in tests/visual/node_modules (npm ci in
+tests/visual). Run tests/Setup-VisualTests.ps1 once to set both up. Without @excalidraw/utils
+the checks still run and the report shows only the Whiteboard pictures.
 
 Usage (from the repo root):
     tests\\.venv\\Scripts\\python tests\\visual\\run_visual_checks.py
@@ -23,6 +27,7 @@ Usage (from the repo root):
 from __future__ import annotations
 
 import argparse
+import html as htmllib
 import json
 import math
 import platform
@@ -30,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -148,7 +154,13 @@ JS_HTML = r"""() => {
       });
     }
   });
-  return {cal, texts, stickers, shapes, arrows, connectors, notes, images};
+  // The anchor divs themselves are 0 x 0 (their content overflows them), so take the union
+  // of everything drawn inside them; comment threads are not board objects.
+  const all = [...document.querySelectorAll('div.anchor[data-whiteboard-type]:not([data-whiteboard-type=CommentThread]) *')]
+              .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
+  const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
+                             Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
+  return {cal, texts, stickers, shapes, arrows, connectors, notes, images, bbox};
 }"""
 
 
@@ -159,13 +171,17 @@ def linfit(xs, ys):
     return k, my - k * mx
 
 
-def measure_html(page, html: Path) -> dict:
+def measure_html(page, html: Path, shot: Path) -> dict:
     page.goto(html.as_uri()); page.wait_for_timeout(1200)
     d = page.evaluate(JS_HTML)
     if len(d["cal"]) < 2:
         raise RuntimeError("fewer than 2 untransformed anchors; can't map screen to board coordinates")
     kx, ox = linfit([c[0] for c in d["cal"]], [c[2] for c in d["cal"]])
     ky, oy = linfit([c[1] for c in d["cal"]], [c[3] for c in d["cal"]])
+    if d["bbox"]:
+        x0, y0, x1, y1 = d["bbox"]; pad = 12
+        page.screenshot(path=str(shot), full_page=True,
+                        clip={"x": max(0, x0 - pad), "y": max(0, y0 - pad), "width": x1 - x0 + 2 * pad, "height": y1 - y0 + 2 * pad})
     to_b = lambda x, y: ((x - ox) / kx, (y - oy) / ky)
     to_box = lambda b: (*to_b(b[0], b[1]), b[2] / kx, b[3] / ky)
     return {
@@ -315,6 +331,58 @@ def measure_scene(page, scene_path: Path, off) -> dict:
 
 
 # ----------------------------------------------------------------------------------------
+# Excalidraw side: a picture of the scene for the report
+# ----------------------------------------------------------------------------------------
+# Excalidraw's own exporter (exportToSvg from @excalidraw/utils, installed into
+# tests/visual/node_modules by Setup-VisualTests.ps1) draws the scene, so the picture is what
+# Excalidraw shows. The bundle is an ES module, which a file:// page can't import, so the page
+# and bundle are served from a made-up origin through Playwright's request routing.
+EXCALIDRAW_BUNDLE = Path(__file__).resolve().parent / "node_modules" / "@excalidraw" / "utils" / "dist" / "prod"
+RENDER_ORIGIN = "http://excalidraw.test/"
+RENDER_PAGE = """<!doctype html><html><head><meta charset=utf-8>
+<style>html,body{margin:0;background:#fff}</style></head><body>
+<script type=module>
+import { exportToSvg } from './index.js';
+window.render = async (scene) => {
+  const svg = await exportToSvg({
+    data: { elements: scene.elements.filter(e => !e.isDeleted), files: scene.files || {},
+            appState: { ...(scene.appState || {}), exportBackground: true } },
+    config: { canvasBackgroundColor: '#ffffff', padding: 12 } });
+  document.body.innerHTML = ''; document.body.appendChild(svg);
+  const r = svg.getBoundingClientRect(); return [r.width, r.height];
+};
+window.ready = true;
+</script></body></html>"""
+
+
+def open_renderer(browser):
+    """A page that can draw .excalidraw scenes, or None when @excalidraw/utils isn't installed."""
+    if not (EXCALIDRAW_BUNDLE / "index.js").is_file():
+        return None
+    def serve(route):
+        rel = route.request.url[len(RENDER_ORIGIN):].split("?")[0].replace("%20", " ")
+        if rel in ("", "render.html"):
+            return route.fulfill(body=RENDER_PAGE, content_type="text/html")
+        f = EXCALIDRAW_BUNDLE / rel
+        if f.is_file():
+            return route.fulfill(path=str(f))
+        route.fulfill(status=404, body="")
+    page = browser.new_page()
+    page.route(RENDER_ORIGIN + "**", serve)
+    page.goto(RENDER_ORIGIN + "render.html")
+    page.wait_for_function("window.ready === true", timeout=60000)
+    return page
+
+
+def render_scene(page, scene_path: Path, shot: Path):
+    scene = json.loads(scene_path.read_text(encoding="utf-8"))
+    w, h = page.evaluate("s => window.render(s)", scene)
+    page.set_viewport_size({"width": max(200, math.ceil(w)), "height": max(200, math.ceil(h))})
+    page.wait_for_timeout(300)
+    page.screenshot(path=str(shot), full_page=True)
+
+
+# ----------------------------------------------------------------------------------------
 # Comparisons
 # ----------------------------------------------------------------------------------------
 def seg_dist(p, a, b):
@@ -425,6 +493,45 @@ def compare(src: dict, out: dict) -> dict:
 
 
 # ----------------------------------------------------------------------------------------
+# Report
+# ----------------------------------------------------------------------------------------
+def write_report(out_root: Path, results: list[dict], rendered: bool):
+    def cell(r, k):
+        v = r["checks"].get(k) if r.get("checks") else None
+        if not v: return "<td>—</td>"
+        if k == "text":
+            return f"<td>{v['matched']}/{v['expected']} · median {v['median']} / max {v['max']}</td>"
+        return f"<td>{v['matched']}/{v['expected']}" + (f" · max {v['max']}" if v['max'] is not None else "") + "</td>"
+    cols = ("text", "sticker", "note", "image", "shape", "connector", "arrow")
+    rows = "".join(
+        f"<tr class='{'bad' if r['status'] != 'PASS' else ''}'><td><a href='#{r['board']}'>{r['board']}</a></td>"
+        f"<td>{r['version']}</td><td>{r['status']}</td>"
+        + "".join(cell(r, k) for k in cols)
+        + f"<td>{htmllib.escape('; '.join(r.get('fails', [])))}</td></tr>" for r in results)
+    figs = ""
+    for b in sorted({r["board"] for r in results}):
+        imgs = f"<figure><img src='shots/{b}_html.png'><figcaption>Whiteboard export</figcaption></figure>"
+        for v in VERSIONS:
+            if (out_root / "shots" / f"{b}_{v}.png").exists():
+                imgs += f"<figure><img src='shots/{b}_{v}.png'><figcaption>{v} → .excalidraw</figcaption></figure>"
+        figs += f"<h2 id='{b}'>{b}</h2><div class=grid>{imgs}</div>"
+    note = ("Renders are drawn by Excalidraw's own exporter (@excalidraw/utils exportToSvg)." if rendered else
+            "Excalidraw renders are missing: run tests\\Setup-VisualTests.ps1 to install @excalidraw/utils.")
+    doc = f"""<!doctype html><html><head><meta charset=utf-8><title>Visual checks</title><style>
+body{{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1d1b22;background:#fbfbfd}}
+table{{border-collapse:collapse;font-variant-numeric:tabular-nums}} td,th{{border:1px solid #ddd;padding:3px 8px}}
+th{{background:#f1eff6}} tr.bad td{{background:#fde8e8}} .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
+figure{{margin:0;background:#f1eff6;padding:6px;border-radius:6px}} img{{width:100%;background:#fff}}
+figcaption{{font-size:12px;color:#666;text-align:center}}</style></head><body>
+<h1>Whiteboard → Excalidraw visual checks</h1>
+<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: {', '.join(f'{k} {v}' for k, v in TOL.items())}.
+{note}</p>
+<table><tr><th>Board</th><th>Script</th><th>Status</th><th>Text</th><th>Stickers</th><th>Notes</th><th>Images</th><th>Shapes</th><th>Connectors</th><th>Arrowheads</th><th>Problems</th></tr>{rows}</table>
+{figs}</body></html>"""
+    (out_root / "report.html").write_text(doc, encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scripts", type=Path, default=REPO, help="folder with the converter scripts")
@@ -436,7 +543,7 @@ def main():
     a = ap.parse_args()
 
     ps = find_powershell(a.powershell)
-    a.out.mkdir(parents=True, exist_ok=True)
+    a.out.mkdir(parents=True, exist_ok=True); (a.out / "shots").mkdir(exist_ok=True)
     samples = sorted(d for d in a.samples.iterdir() if d.is_dir() and (not a.sample or d.name in a.sample))
     scripts = {v: instrument(a.scripts / f"Convert-WhiteboardHtmlToExcalidraw-{v}.ps1",
                              a.out / "_instrumented" / f"Convert-WhiteboardHtmlToExcalidraw-{v}.ps1") for v in a.version}
@@ -445,11 +552,15 @@ def main():
         browser = p.chromium.launch()
         hpage = browser.new_page(viewport={"width": 1600, "height": 1000}, device_scale_factor=2)
         tpage = browser.new_page()
+        rpage = open_renderer(browser)
+        if not rpage:
+            print("@excalidraw/utils is not installed (run tests\\Setup-VisualTests.ps1): "
+                  "the report will have no Excalidraw renders.", flush=True)
         for d in samples:
             html = next(d.glob("*.html"), None)
             if not html: continue
             try:
-                src = measure_html(hpage, html)
+                src = measure_html(hpage, html, a.out / "shots" / f"{d.name}_html.png")
             except Exception as e:
                 results.append({"board": d.name, "version": "-", "status": "ERROR", "fails": [f"HTML: {e}"]}); continue
             for v, script in scripts.items():
@@ -464,6 +575,12 @@ def main():
                         r["status"] = "FAIL" if r["fails"] else "PASS"
                     except Exception as e:
                         r.update(status="ERROR", fails=[repr(e)])
+                    if rpage:
+                        # The picture is for people; a failed render doesn't fail the geometry check.
+                        try:
+                            render_scene(rpage, scene, a.out / "shots" / f"{d.name}_{v}.png")
+                        except Exception as e:
+                            print(f"{d.name} {v}: render failed: {e}", flush=True)
                 results.append(r)
                 c = r.get("checks", {})
                 m = lambda k: c.get(k, {}).get("max")
@@ -472,9 +589,10 @@ def main():
                       f"{'; '.join(r.get('fails', []))}", flush=True)
         browser.close()
     (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+    write_report(a.out, results, rpage is not None)
     bad = [r for r in results if r["status"] != "PASS"]
     print(f"\n{len(results)} check(s): {len(results) - len(bad)} passed, {len(bad)} failed. "
-          f"Tolerances (board px): {TOL}. Details: {a.out / 'results.json'}")
+          f"Tolerances (board px): {TOL}. Report: {a.out / 'report.html'}")
     sys.exit(1 if bad else 0)
 
 

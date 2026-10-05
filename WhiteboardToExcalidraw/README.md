@@ -60,7 +60,7 @@ The run summary reports every item below when it occurs.
 ## Tests
 ```powershell
 .\tests\Invoke-SmokeTest.ps1      # structure and content, all samples x both scripts
-.\tests\Setup-VisualTests.ps1     # once: Python venv + Playwright Chromium (-InstallPython if needed)
+.\tests\Setup-VisualTests.ps1     # once: Python venv, Playwright Chromium, @excalidraw/utils (-InstallPython if needed)
 .\tests\Invoke-VisualTests.ps1    # geometry vs. Whiteboard's real layout
 ```
 
@@ -68,4 +68,6 @@ The run summary reports every item below when it occurs.
 - **Visual tests:** they measure the original board in headless Chromium and compare every
   text, note, shape, sticker, image, connector and arrowhead with the converted scene. They
   also fail any line of text that Excalidraw would clip. The report is written to
-  `tests\out\visual\report.html`.
+  `tests\out\visual\report.html`, and shows each board next to both converted scenes, drawn
+  by Excalidraw's own exporter. Setup installs that exporter with npm, so it needs Node.js.
+  Without it the checks still run, but the report shows only the Whiteboard pictures.

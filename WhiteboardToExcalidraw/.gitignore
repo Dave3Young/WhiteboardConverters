@@ -1,5 +1,6 @@
-# Test outputs and the local Python environment for the visual checks
+# Test outputs and the local Python and npm environments for the visual checks
 tests/out/
 tests/.venv/
+tests/visual/node_modules/
 __pycache__/
 *.pyc
