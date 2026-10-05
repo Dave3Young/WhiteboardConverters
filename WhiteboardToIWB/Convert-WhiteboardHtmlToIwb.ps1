@@ -124,6 +124,9 @@ begin {
     # Plain text and shape labels are "sans-serif" in the export, which renders as Arial.
     $TextFontFamily = 'Arial'
 
+    # A drawn underline's distance below the top of its text, in font sizes.
+    $UnderlineOffset = 1.05
+
     # Long side, in px, of a rasterised sticker.
     $StickerRasterSize = 256
 
@@ -566,7 +569,8 @@ begin {
             # Optional unit rotation (no scale): the box's local x axis is (M11, M12) and its
             # local y axis is (M21, M22), in SVG matrix order.
             [double]$M11 = 1, [double]$M12 = 0, [double]$M21 = 0, [double]$M22 = 1,
-            [int]$Weight = 400, [string]$Family = $TextFontFamily, [string]$Group = $null
+            [int]$Weight = 400, [string]$Family = $TextFontFamily, [string]$Group = $null,
+            [bool]$Underline = $false
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $FontSize = Get-ScalarDouble $FontSize 20
@@ -579,7 +583,39 @@ begin {
             Kind = 'Text'; X = $X; Y = $Y; Width = $Width; Height = $Height
             FontSize = $FontSize; Color = $Color; Align = $Align; Family = $Family; Weight = $Weight
             Text = $Text; M11 = $M11; M12 = $M12; M21 = $M21; M22 = $M22; Group = $Group
+            Underline = $Underline
         })
+    }
+
+    function Test-Underline {
+        # Whiteboard underlines a whole text box with text-decoration on its textBoxCore div.
+        param([string]$Style)
+        return "$(Get-StyleValue $Style 'text-decoration')" -match '\bunderline\b'
+    }
+
+    function Add-IwbUnderline {
+        # OpenBoard's IWB importer ignores text-decoration, so an underline is also drawn as a
+        # line grouped with its text. Only for one unrotated line: the line is measured with
+        # the same font, and wrapped lines can't be placed without the renderer's line breaks.
+        # Returns $false when no line was drawn.
+        param([Collections.Generic.List[object]]$Graphics, [string]$Text, [double]$X, [double]$Y,
+              [double]$Width, [double]$FontSize, [string]$Color, [string]$Align, [int]$Weight,
+              [string]$Family, [string]$Group)
+        if ($Text.Contains("`n")) { return $false }
+        try {
+            Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+            $style = if ($Weight -ge 600) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular }
+            $font = New-Object Drawing.Font($Family, [single]$FontSize, $style, [Drawing.GraphicsUnit]::Pixel)
+            $bmp = New-Object Drawing.Bitmap(1, 1)
+            $gfx = [Drawing.Graphics]::FromImage($bmp)
+            try { $textWidth = $gfx.MeasureString($Text, $font, [Drawing.PointF]::Empty, [Drawing.StringFormat]::GenericTypographic).Width }
+            finally { $gfx.Dispose(); $bmp.Dispose(); $font.Dispose() }
+        } catch { return $false }
+        if ($textWidth -le 0 -or $textWidth -gt $Width) { return $false }
+        $left = switch ($Align) { 'center' { $X + (($Width - $textWidth) / 2) } 'right' { $X + $Width - $textWidth } default { $X } }
+        $lineY = $Y + ($FontSize * $UnderlineOffset)
+        Add-IwbLine $Graphics $left $lineY ($left + $textWidth) $lineY $Color ([Math]::Max(1.0, $FontSize * 0.07)) $null $Group
+        return $true
     }
 
     function Add-IwbImage {
@@ -971,8 +1007,9 @@ begin {
                     } else {
                         $position = ' x="{0}" y="{1}"' -f (& $px $g.X), (& $py $g.Y)
                     }
-                    [void]$sb.Append(('<svg:textarea id="{0}"{1} width="{2}" height="{3}" font-family="{4}" font-size="{5}pt" font-weight="{6}" fill="{7}" text-align="{8}" xml:space="preserve">' -f `
-                        $id, $position, (& $len $g.Width), (& $len $g.Height), $g.Family, $fontPt, $weight, $g.Color, $align))
+                    $decoration = if ($g.Underline) { ' text-decoration="underline"' } else { '' }
+                    [void]$sb.Append(('<svg:textarea id="{0}"{1} width="{2}" height="{3}" font-family="{4}" font-size="{5}pt" font-weight="{6}" fill="{7}" text-align="{8}"{9} xml:space="preserve">' -f `
+                        $id, $position, (& $len $g.Width), (& $len $g.Height), $g.Family, $fontPt, $weight, $g.Color, $align, $decoration))
                     [void]$sb.Append(((@($g.Text -split "`n") | ForEach-Object { ConvertTo-XmlText $_ }) -join '<svg:tbreak/>'))
                     [void]$sb.Append('</svg:textarea>')
                 }
@@ -1046,6 +1083,7 @@ begin {
         $dashedCount = 0
         $stickerImageCount = 0; $stickerFallbackCount = 0
         $shapeTracedCount = 0; $shapeFallbackCount = 0; $shapeEdgesCount = 0
+        $underlineDrawn = 0; $underlineNotDrawn = 0
         $rotatedTextCount = 0; $rotatedShapeCount = 0; $rotationIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
         $groupNumber = 0
@@ -1107,12 +1145,19 @@ begin {
                         $origin = ConvertTo-BoardPoints $a @(,[double[]]@(($u0 + (($lw - $innerWidth) / 2)), ($v0 + (($lh - $textHeight) / 2))))
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
+                        $shapeWeight = Get-FontWeight $shapeCoreStyle 700
+                        $shapeUnderline = Test-Underline $shapeCoreStyle
                         # The text box turns with the shape.
                         Add-IwbText $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) ($textHeight * $a.ScaleY) `
                             ($fontLocal * $a.ScaleY) $textColor $textAlign `
                             ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) `
-                            -Weight (Get-FontWeight $shapeCoreStyle 700) -Group $group
+                            -Weight $shapeWeight -Group $group -Underline $shapeUnderline
                         if ($a.IsRotated) { $rotatedTextCount++ }
+                        if ($shapeUnderline) {
+                            if (-not $a.IsRotated -and (Add-IwbUnderline $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) `
+                                    ($fontLocal * $a.ScaleY) $textColor $textAlign $shapeWeight $TextFontFamily $group)) { $underlineDrawn++ }
+                            else { $underlineNotDrawn++ }
+                        }
                     }
                 }
                 'PlainText' {
@@ -1131,6 +1176,9 @@ begin {
                     else { $width = [Math]::Max(20.0, $text.Length * $font * 0.58 / $a.ScaleX) }
                     $width *= $a.ScaleX
                     $weight = Get-FontWeight $coreStyle 400
+                    $underline = Test-Underline $coreStyle
+                    # Plain text is grouped only with a drawn underline.
+                    $textGroup = if ($underline) { $group } else { $null }
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
                     # Text origin = anchor + matrix * (insetLeft, insetTop); for rotated text the
@@ -1140,9 +1188,16 @@ begin {
                     if ($a.IsRotated) {
                         $rotatedTextCount++
                         Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align `
-                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight
+                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight `
+                            -Group $textGroup -Underline $underline
+                        if ($underline) { $underlineNotDrawn++ }
                     } else {
-                        Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align -Weight $weight
+                        Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align -Weight $weight `
+                            -Group $textGroup -Underline $underline
+                        if ($underline) {
+                            if (Add-IwbUnderline $graphics $text $textX $textY $width $font $color $align $weight $TextFontFamily $group) { $underlineDrawn++ }
+                            else { $underlineNotDrawn++ }
+                        }
                     }
                 }
                 'Note' {
@@ -1172,9 +1227,17 @@ begin {
                     }
                     if ($text.Trim()) {
                         $noteFont = Get-CssNumber $noteStyle 'font-size' 24
-                        Add-IwbText $graphics $text ($a.X + ($NoteTextInsetLeft * $a.ScaleX)) ($a.Y + ($NoteTextInsetTop * $a.ScaleY)) `
-                            (($cssW - $NoteTextColumnInset) * $a.ScaleX) (($cssH - $NoteTextInsetTop - 12) * $a.ScaleY) `
-                            ($noteFont * $a.ScaleY) $color 'left' -Weight (Get-FontWeight $coreStyle 700) -Family $NoteFontFamily -Group $group
+                        $noteWeight = Get-FontWeight $coreStyle 700
+                        $noteUnderline = Test-Underline $coreStyle
+                        $noteTextX = $a.X + ($NoteTextInsetLeft * $a.ScaleX); $noteTextY = $a.Y + ($NoteTextInsetTop * $a.ScaleY)
+                        $noteTextW = ($cssW - $NoteTextColumnInset) * $a.ScaleX
+                        Add-IwbText $graphics $text $noteTextX $noteTextY $noteTextW (($cssH - $NoteTextInsetTop - 12) * $a.ScaleY) `
+                            ($noteFont * $a.ScaleY) $color 'left' -Weight $noteWeight -Family $NoteFontFamily -Group $group -Underline $noteUnderline
+                        if ($noteUnderline) {
+                            if (Add-IwbUnderline $graphics $text $noteTextX $noteTextY $noteTextW ($noteFont * $a.ScaleY) $color 'left' `
+                                    $noteWeight $NoteFontFamily $group) { $underlineDrawn++ }
+                            else { $underlineNotDrawn++ }
+                        }
                     }
                 }
                 'Connector' {
@@ -1345,6 +1408,7 @@ begin {
             RotatedTextConverted = $rotatedTextCount; RotatedShapesConverted = $rotatedShapeCount
             RotationIgnored = $rotationIgnored.Count; RotationIgnoredDetails = @($rotationIgnored)
             ArrowheadsConverted = $arrowheadCount
+            UnderlinesDrawn = $underlineDrawn; UnderlinesNotDrawn = $underlineNotDrawn
         }
     }
 }
@@ -1399,6 +1463,12 @@ process {
         }
         if ($result.DashedStrokes -gt 0) {
             Write-Host ("  {0} dashed stroke(s) kept as dashes (OpenBoard's IWB import draws them solid)." -f $result.DashedStrokes)
+        }
+        if ($result.UnderlinesDrawn -gt 0) {
+            Write-Host ("  {0} underlined text(s) also given a drawn underline (OpenBoard's IWB import ignores text-decoration)." -f $result.UnderlinesDrawn)
+        }
+        if ($result.UnderlinesNotDrawn -gt 0) {
+            Write-Warning ("{0} underlined text(s) are wrapped or rotated, so only carry text-decoration: OpenBoard shows them without an underline." -f $result.UnderlinesNotDrawn)
         }
         if ($result.UnsupportedObjects -gt 0) {
             Write-Warning ("{0} object(s) were unsupported. Details: {1}" -f `

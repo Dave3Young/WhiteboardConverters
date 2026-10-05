@@ -59,7 +59,10 @@ The run summary reports these when they occur.
 - **Stickers kept as SVG:** without Edge/Chrome, or with `-NoRasterize`, stickers stay SVG.
   OpenBoard shows them, but other IWB apps may not, because SVG isn't a CFF image format.
 - **Rotated notes, images and stickers** are drawn unrotated. None of the samples has any.
-- **Formatting:** underline and the original font face are dropped.
+- **Formatting:** the original font face is dropped.
+- **Underline:** text keeps `text-decoration="underline"`, but OpenBoard's importer ignores it,
+  so a single unrotated line also gets a drawn underline grouped with it. Wrapped or rotated
+  underlined text has no drawn line, and the run summary says so.
 - **Untested imports:** the files haven't yet been tried in OpenBoard itself, or in other IWB
   readers such as SMART Notebook or ActivInspire. The conversions are checked against
   OpenBoard's importer source code and the test suites below.

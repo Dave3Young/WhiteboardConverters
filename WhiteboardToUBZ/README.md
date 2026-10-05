@@ -50,7 +50,7 @@ The run summary reports every item below when it occurs.
 - **Dashed lines** are drawn solid, because OpenBoard has no dashed ink style.
 - **Rotated notes, images and stickers** are drawn unrotated at the right size. None of the
   samples has any.
-- **Formatting:** underline and the original font face are dropped.
+- **Formatting:** the original font face is dropped. Underline is kept.
 - **Unverified cases:** there are no samples of text inside shapes, or of elbow or curved
   connectors.
 

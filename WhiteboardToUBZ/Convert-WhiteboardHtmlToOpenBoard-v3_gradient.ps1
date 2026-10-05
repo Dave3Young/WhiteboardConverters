@@ -356,7 +356,8 @@ begin {
             [double]$M11 = 1, [double]$M12 = 0, [double]$M21 = 0, [double]$M22 = 1,
             # CSS font-weight of the source text (Whiteboard headings are 600, note text 700).
             # Dropping it drew them narrower, which moved centred and right-aligned lines.
-            [int]$Weight = 400
+            [int]$Weight = 400,
+            [bool]$Underline = $false
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $X = Get-ScalarDouble $X; $Y = Get-ScalarDouble $Y
@@ -368,7 +369,7 @@ begin {
         [void]$Graphics.Add([pscustomobject]@{
             Kind = 'Text'; X = $X; Y = $Y; Width = $Width; Height = $Height
             FontSize = $FontSize; Color = $Color; Align = $Align; Family = 'Arial'; Weight = $Weight
-            Text = $Text; M11 = $M11; M12 = $M12; M21 = $M21; M22 = $M22
+            Underline = $Underline; Text = $Text; M11 = $M11; M12 = $M12; M21 = $M21; M22 = $M22
         })
     }
 
@@ -389,6 +390,12 @@ begin {
         if ($v -eq 'bold') { return 700 }
         if ($v -eq 'normal') { return 400 }
         return $Default
+    }
+
+    function Test-Underline {
+        # Whiteboard underlines a whole text box with text-decoration on its textBoxCore div.
+        param([string]$Style)
+        return "$(Get-StyleValue $Style 'text-decoration')" -match '\bunderline\b'
     }
 
     function Add-UbzFilledPolygon {
@@ -862,8 +869,9 @@ begin {
                     $w = $g.Width.ToString($ci); $h = $g.Height.ToString($ci); $fs = $g.FontSize.ToString($ci)
                     # Qt rich text collapses raw newlines to spaces, so line breaks become <br />.
                     $safe = (ConvertTo-XmlText $g.Text).Replace("`n", '<br />')
-                    $html = '<p style="margin:0px; text-align:{4}; font-family:''{0}''; font-size:{1}px; font-weight:{5}; color:{2};">{3}</p>' -f `
-                        $g.Family, $fs, $g.Color, $safe, $g.Align, $g.Weight
+                    $decoration = if ($g.Underline) { ' text-decoration:underline;' } else { '' }
+                    $html = '<p style="margin:0px; text-align:{4}; font-family:''{0}''; font-size:{1}px; font-weight:{5}; color:{2};{6}">{3}</p>' -f `
+                        $g.Family, $fs, $g.Color, $safe, $g.Align, $g.Weight, $decoration
                     $innerEscaped = ConvertTo-XmlText $html
                     $colorDark = if ((Get-Luminance $g.Color) -lt 128) { '#ffffff' } else { $g.Color }
                     [void]$sb.Append('  <foreignObject ub:type="text"')
@@ -1071,7 +1079,7 @@ begin {
                         # The text box turns with the shape (unit rotation, as for rotated PlainText).
                         Add-UbzText $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) ($textHeight * $a.ScaleY) `
                             ($fontLocal * $a.ScaleY) $textColor $textAlign `
-                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight (Get-FontWeight $shapeCoreStyle 700)
+                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight (Get-FontWeight $shapeCoreStyle 700) -Underline (Test-Underline $shapeCoreStyle)
                         if ($a.IsRotated) { $rotatedTextCount++ }
                     }
                 }
@@ -1097,6 +1105,7 @@ begin {
                     $width *= $a.ScaleX
                     $height = (Get-TextLineCount $text $width $font) * $font * 1.25
                     $weight = Get-FontWeight $coreStyle 400
+                    $underline = Test-Underline $coreStyle
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
                     # Text origin = anchor + matrix * (insetLeft, insetTop). With no rotation this
@@ -1106,9 +1115,9 @@ begin {
                     if ($a.IsRotated) {
                         $rotatedTextCount++
                         Add-UbzText $graphics $text $textX $textY $width $height $font $color $align `
-                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight
+                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight -Underline $underline
                     } else {
-                        Add-UbzText $graphics $text $textX $textY $width $height $font $color $align -Weight $weight
+                        Add-UbzText $graphics $text $textX $textY $width $height $font $color $align -Weight $weight -Underline $underline
                     }
                 }
                 'Note' {
@@ -1131,7 +1140,7 @@ begin {
                         Add-UbzText $graphics $text ($a.X + ($NoteTextInsetLeft * $a.ScaleX)) ($a.Y + ($NoteTextInsetTop * $a.ScaleY)) `
                             (((Get-CssNumber $noteStyle 'width' 304) - $NoteTextColumnInset) * $a.ScaleX) `
                             (((Get-CssNumber $noteStyle 'height' 304) - $NoteTextInsetTop - 12) * $a.ScaleY) `
-                            ($noteFont * $a.ScaleY) $color 'left' -Weight (Get-FontWeight $coreStyle 700)
+                            ($noteFont * $a.ScaleY) $color 'left' -Weight (Get-FontWeight $coreStyle 700) -Underline (Test-Underline $coreStyle)
                     }
                 }
                 'Connector' {
