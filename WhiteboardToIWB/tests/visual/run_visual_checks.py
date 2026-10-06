@@ -6,7 +6,8 @@ For every sample export and both note fills (Solid, Gradient) this:
      change is one XML comment recording the board-to-page mapping, so board coordinates can
      be recovered exactly -- the script in the repo is never modified);
   2. renders the Whiteboard HTML in headless Chromium and measures where Whiteboard really
-     puts every text, sticker/image, note, shape outline and connector arrowhead;
+     puts every text, sticker/image, note, shape outline, connector arrowhead and ink stroke,
+     and which colours it paints each note;
   3. renders the IWB page as a standard SVG renderer shows it (textarea as a wrapped HTML
      box) and measures the same things;
   4. writes tests/out/visual/report.html (side-by-side screenshots + accuracy tables) and
@@ -49,7 +50,9 @@ SCRIPT = "Convert-WhiteboardHtmlToIwb.ps1"
 
 # Pass/fail tolerances in board pixels.
 # image_content: mean colour difference (0-255) between the two images' 8 x 8 thumbnails.
-TOL = {"text": 5.0, "image": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5, "image_content": 12.0}
+TOL = {"text": 5.0, "image": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5, "image_content": 12.0,
+       "note_color": 3.0, "ink": 0.5, "ink_width": 0.1}
+# note_color: largest channel difference (0-255) at five points of each note; ink_width in board px.
 
 # An image's 8 x 8 thumbnail drawn on white, as 192 RGB values (JS function source).
 THUMB = r"""async (src) => { const im = new Image(); im.src = src; await im.decode();
@@ -112,7 +115,7 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path, fill: str) -
 # Whiteboard side: measure the export in the browser
 # ----------------------------------------------------------------------------------------
 JS_HTML = (r"""async () => {
-  const cal = [], texts = [], images = [], shapes = [], arrows = [], notes = [];
+  const cal = [], texts = [], images = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [];
   const thumb = THUMB;
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   for (const a of document.querySelectorAll('div.anchor[data-whiteboard-type]')) {
@@ -133,9 +136,20 @@ JS_HTML = (r"""async () => {
       if (im) { const i = im.getBoundingClientRect(); images.push([i.left + scrollX, i.top + scrollY, i.width, i.height, await thumb(im.src)]); }
     }
     if (type === 'Note') {
-      const b = a.querySelector('.textBoxBackground').getBoundingClientRect();
+      const bg = a.querySelector('.textBoxBackground'), b = bg.getBoundingClientRect(), cs = getComputedStyle(bg);
       notes.push([b.left + scrollX, b.top + scrollY, b.width, b.height]);
+      noteStyles.push({color: cs.backgroundColor, image: cs.backgroundImage});
     }
+    // Ink: each stroke's centreline (the hidden hit-test polyline) and its pen width, twice
+    // the radius of the round joins in the visible outline path.
+    if (type === 'InkGroup') a.querySelectorAll('g.inkStroke').forEach(g => {
+      const pl = g.querySelector('polyline'), p = g.querySelector('path');
+      if (!pl) return;
+      const m = pl.getScreenCTM(), n = pl.points.numberOfItems, pts = [];
+      for (let i = 0; i < n; i++) { const q = pl.points.getItem(i); pts.push(pt(m, q.x, q.y)); }
+      const r = /[Aa]\s*([\d.]+)/.exec(p ? p.getAttribute('d') : '');
+      inks.push({pts, w: r ? 2 * r[1] * Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) : null});
+    });
     if (type === 'Shape') {
       const svg = a.querySelector('svg.shape'), p = svg && svg.querySelector('g > path');
       if (p) {
@@ -155,7 +169,7 @@ JS_HTML = (r"""async () => {
               .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
-  return {cal, texts, images, shapes, arrows, notes, bbox};
+  return {cal, texts, images, shapes, arrows, notes, noteStyles, inks, bbox};
 }""").replace("THUMB", THUMB, 1)
 
 
@@ -185,7 +199,78 @@ def measure_html(page, html: Path, shot: Path) -> dict:
         "notes": [(*to_b(s[0], s[1]), s[2] / kx, s[3] / ky) for s in d["notes"]],
         "shapes": [{"label": s["label"], "pts": [to_b(*q) for q in s["pts"]]} for s in d["shapes"]],
         "arrows": [[to_b(*q) for q in a] for a in d["arrows"]],
+        "note_paints": [note_paint(s) for s in d["noteStyles"]],
+        "inks": [{"pts": [to_b(*q) for q in s["pts"]], "w": s["w"] / kx if s["w"] else None} for s in d["inks"]],
     }
+
+
+def parse_rgbs(s: str) -> list[tuple]:
+    return [tuple(int(v) for v in m) for m in re.findall(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", s)]
+
+
+def note_paint(style: dict) -> tuple:
+    """A note's colours from the browser's computed style: (solid, gradient), gradient being
+    (start, end, angle in CSS degrees) or None. A note with a transparent background-color
+    (Whiteboard's newer note style) is expected to use its gradient's end colour when solid."""
+    grad = None
+    m = re.search(r"linear-gradient\(((?:[^()]|\([^()]*\))*)\)", style["image"])
+    if m:
+        cols = parse_rgbs(m.group(1)); ang = re.match(r"\s*([-\d.]+)deg", m.group(1))
+        if len(cols) >= 2:
+            grad = (cols[0], cols[-1], float(ang.group(1)) if ang else 180.0)
+    transparent = not parse_rgbs(style["color"]) or re.search(r"rgba\([^)]*,\s*0\)", style["color"])
+    solid = (grad[1] if grad else None) if transparent else parse_rgbs(style["color"])[0]
+    return solid, grad
+
+
+def expected_note_color(box, paint, solid_only, x, y):
+    solid, grad = paint
+    if solid_only or not grad:
+        return solid
+    a = math.radians(grad[2]); dx, dy = math.sin(a), -math.cos(a)
+    t = ((x - box[0] - box[2] / 2) * dx + (y - box[1] - box[3] / 2) * dy) / (abs(box[2] * dx) + abs(box[3] * dy)) + 0.5
+    t = min(1.0, max(0.0, t))
+    return tuple(s + (e - s) * t for s, e in zip(grad[0], grad[1]))
+
+
+def point_in_poly(x, y, poly) -> bool:
+    inside = False
+    for i in range(len(poly)):
+        (x1, y1), (x2, y2) = poly[i], poly[i - 1]
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            inside = not inside
+    return inside
+
+
+NOTE_SAMPLES = ((0.08, 0.08), (0.92, 0.08), (0.5, 0.5), (0.08, 0.92), (0.92, 0.92))
+
+
+def note_color_err(box, paint, solid_only, polys) -> float:
+    """Largest channel difference between the colour Whiteboard paints and the colour of the
+    topmost output rect or polygon, at five points inside the note."""
+    worst = 0.0
+    for fx, fy in NOTE_SAMPLES:
+        x, y = box[0] + fx * box[2], box[1] + fy * box[3]
+        exp = expected_note_color(box, paint, solid_only, x, y)
+        got = None
+        for pts, rgb in polys:
+            if point_in_poly(x, y, pts):
+                got = rgb
+        if exp is None:
+            continue
+        if got is None:
+            return 255.0
+        worst = max(worst, max(abs(e - g) for e, g in zip(exp, got)))
+    return round(worst, 1)
+
+
+def hex_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
 
 
 # ----------------------------------------------------------------------------------------
@@ -220,6 +305,10 @@ def textarea_lines(el) -> list[str]:
     return lines
 
 
+# OpenBoard's weight names as CSS weights (demibold isn't a CSS keyword).
+CSS_WEIGHT = {"light": "300", "demibold": "600", "black": "900"}
+
+
 def browser_svg(z: zipfile.ZipFile, page, size) -> str:
     """The page as plain SVG: images inlined, each textarea as a wrapped HTML box."""
     w, h = size
@@ -238,7 +327,7 @@ def browser_svg(z: zipfile.ZipFile, page, size) -> str:
             out.append(f'<image {attrs(el)} href="data:image/{mime};base64,{data}" preserveAspectRatio="none"/>')
         elif tag == "textarea":
             align = {"center": "center", "end": "right"}.get(el.get("text-align"), "left")
-            style = (f"font-family:'{el.get('font-family')}';font-size:{el.get('font-size')};font-weight:{el.get('font-weight')};"
+            style = (f"font-family:'{el.get('font-family')}';font-size:{el.get('font-size')};font-weight:{CSS_WEIGHT.get(el.get('font-weight'), el.get('font-weight'))};"
                      f"color:{el.get('fill')};text-align:{align};white-space:pre-wrap;overflow-wrap:break-word;"
                      "line-height:normal;margin:0;width:100%;overflow:visible")
             body = "<br/>".join(htmllib.escape(line) for line in textarea_lines(el))
@@ -276,7 +365,7 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
     page_.screenshot(path=str(shot), full_page=True)
     texts = [dict(t, bx=B(t["x"], t["y"])[0], by=B(t["x"], t["y"])[1]) for t in page_.evaluate(JS_SVG)]
 
-    images, rects, polys, by_group = [], [], [], {}
+    images, rects, polys, by_group, bands = [], [], [], {}, {}
     for el in page:
         tag = local(el.tag); gid = groups.get(el.get("id"))
         if tag == "image":
@@ -285,28 +374,40 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
         elif tag == "rect":
             x, y = B(float(el.get("x")), float(el.get("y")))
             box = (x, y, float(el.get("width")) / s, float(el.get("height")) / s)
-            rects.append({"box": box, "borderless": el.get("stroke-width") == "0", "group": gid})
+            rects.append({"box": box, "borderless": el.get("stroke-width") == "0", "group": gid, "fill": el.get("fill")})
         elif tag == "polygon":
             polys.append([B(*p) for p in pts_of(el)])
+            if el.get("stroke-width") == "0" and gid is not None:   # an angled gradient band
+                bands.setdefault(gid, []).append(([B(*p) for p in pts_of(el)], hex_rgb(el.get("fill"))))
         if tag == "polyline":
-            by_group.setdefault(gid if gid is not None else ("solo", el.get("id")), []).append([B(*p) for p in pts_of(el)])
+            by_group.setdefault(gid if gid is not None else ("solo", el.get("id")), []).append(
+                ([B(*p) for p in pts_of(el)], float(el.get("stroke-width") or 0) / s))
 
-    # Notes: every borderless rect, plus the union of each group's gradient bands.
+    # Notes: every borderless rect, plus the union of each group's gradient bands (borderless
+    # rects, and polygons across an angled gradient). Each keeps its polygons and colours.
+    rect_poly = lambda b: [(b[0], b[1]), (b[0] + b[2], b[1]), (b[0] + b[2], b[1] + b[3]), (b[0], b[1] + b[3])]
     notes = [r["box"] for r in rects if r["borderless"]]
-    band_groups = {}
+    note_polys = [[(rect_poly(r["box"]), hex_rgb(r["fill"]))] for r in rects if r["borderless"]]
     for r in rects:
         if r["borderless"] and r["group"] is not None:
-            band_groups.setdefault(r["group"], []).append(r["box"])
-    for boxes in band_groups.values():
-        if len(boxes) >= 4:
-            x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
-            notes.append((x0, y0, max(b[0] + b[2] for b in boxes) - x0, max(b[1] + b[3] for b in boxes) - y0))
+            bands.setdefault(r["group"], []).append((rect_poly(r["box"]), hex_rgb(r["fill"])))
+    for g in bands.values():
+        if len(g) >= 4:
+            pts = [p for poly, _ in g for p in poly]
+            x0 = min(p[0] for p in pts); y0 = min(p[1] for p in pts)
+            notes.append((x0, y0, max(p[0] for p in pts) - x0, max(p[1] for p in pts) - y0)); note_polys.append(g)
     # Shapes: rect corners, polygons, and closed loops of edges (unfilled non-rectangles).
     shapes = [[(b[0], b[1]), (b[0] + b[2], b[1]), (b[0] + b[2], b[1] + b[3]), (b[0], b[1] + b[3])]
               for b in (r["box"] for r in rects)] + polys
-    arrows = []
+    arrows, inks = [], []
     close = lambda p, q: math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-6 / s + 0.01
-    for lines in by_group.values():
+    for group_lines in by_group.values():
+        lines = [l for l, _ in group_lines]
+        # Ink: an open chain of many edges (connectors have at most 3, unfilled shapes close).
+        chained = all(close(lines[i][1], lines[i + 1][0]) for i in range(len(lines) - 1))
+        if len(lines) >= 8 and chained and not close(lines[-1][1], lines[0][0]):
+            inks.append({"pts": [l[0] for l in lines] + [lines[-1][1]], "w": group_lines[0][1]})
+            continue
         if len(lines) >= 3 and close(lines[-1][1], lines[0][0]) and all(close(lines[i][1], lines[i + 1][0]) for i in range(len(lines) - 1)):
             shapes.append([l[0] for l in lines])
         # Arrowheads: two consecutive edges that meet at the tip.
@@ -315,7 +416,8 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
                 arrows.append([a[0], a[1], b[1]])
     thumbs = page_.evaluate("async (srcs) => { const thumb = " + THUMB + "; const r = []; for (const s of srcs) r.push(await thumb(s)); return r; }",
                             [img_src(z, el) for el in page if local(el.tag) == "image"])
-    return {"texts": texts, "images": images, "notes": notes, "shapes": shapes, "arrows": arrows, "thumbs": thumbs}
+    return {"texts": texts, "images": images, "notes": notes, "note_polys": note_polys, "shapes": shapes,
+            "arrows": arrows, "inks": inks, "thumbs": thumbs}
 
 
 # ----------------------------------------------------------------------------------------
@@ -336,7 +438,12 @@ def bbox(pts):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def compare(src: dict, out: dict) -> dict:
+def path_dist(p, pts):
+    """Distance from p to an open polyline."""
+    return min(seg_dist(p, pts[i], pts[i + 1]) for i in range(len(pts) - 1)) if len(pts) > 1 else math.dist(p, pts[0])
+
+
+def compare(src: dict, out: dict, solid_only: bool) -> dict:
     res = {}
     # Texts: match by exact text, in order.
     pool = list(out["texts"]); rows = []
@@ -358,14 +465,28 @@ def compare(src: dict, out: dict) -> dict:
     res["image"] = {"expected": len(src["images"]), "matched": len(out["images"]), "max": round(max(ie), 2) if ie else None,
                     "content": round(max(td), 1) if td else None}
     # Notes: pair each true note box with the nearest output box; largest edge error.
-    ne, pool = [], list(out["notes"])
-    for s in src["notes"]:
+    # Its colour at five points: solid fill, or the gradient at the gradient's angle.
+    ne, nc, pool = [], [], list(zip(out["notes"], out["note_polys"]))
+    for s, paint in zip(src["notes"], src["note_paints"]):
         if not pool: break
         c = (s[0] + s[2] / 2, s[1] + s[3] / 2)
-        j = min(range(len(pool)), key=lambda i: math.hypot(pool[i][0] + pool[i][2] / 2 - c[0], pool[i][1] + pool[i][3] / 2 - c[1]))
-        o = pool.pop(j)
+        j = min(range(len(pool)), key=lambda i: math.hypot(pool[i][0][0] + pool[i][0][2] / 2 - c[0], pool[i][0][1] + pool[i][0][3] / 2 - c[1]))
+        o, polys = pool.pop(j)
         ne.append(max(abs(s[0] - o[0]), abs(s[1] - o[1]), abs(s[0] + s[2] - o[0] - o[2]), abs(s[1] + s[3] - o[1] - o[3])))
+        nc.append(note_color_err(s, paint, solid_only, polys))
     res["note"] = {"expected": len(src["notes"]), "matched": len(ne), "max": round(max(ne), 2) if ne else None}
+    res["note_color"] = {"max": max(nc) if nc else None}
+    # Ink: pair each true stroke with the output stroke nearest its ends; largest distance
+    # either way between the two centrelines, and the width difference.
+    ie, iw, pool = [], [], list(out["inks"])
+    for s in src["inks"]:
+        if not pool: break
+        j = min(range(len(pool)), key=lambda i: math.dist(pool[i]["pts"][0], s["pts"][0]) + math.dist(pool[i]["pts"][-1], s["pts"][-1]))
+        o = pool.pop(j)
+        ie.append(max(max(path_dist(p, o["pts"]) for p in s["pts"]), max(path_dist(p, s["pts"]) for p in o["pts"])))
+        if s["w"] is not None: iw.append(abs(s["w"] - o["w"]))
+    res["ink"] = {"expected": len(src["inks"]), "matched": len(out["inks"]), "max": round(max(ie), 2) if ie else None,
+                  "width": round(max(iw), 3) if iw else None}
     # Shapes: the closest output outline (by bounding box, then both-way distance).
     sh, cands = [], [(o, bbox(o)) for o in out["shapes"]]
     for s in src["shapes"]:
@@ -388,9 +509,13 @@ def compare(src: dict, out: dict) -> dict:
     fails = []
     if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
     if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
-    for k in ("image", "note", "shape", "arrow"):
+    for k in ("image", "note", "shape", "arrow", "ink"):
         if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
         if res[k]["max"] is not None and res[k]["max"] > TOL[k]: fails.append(f"{k} off by {res[k]['max']} px")
+    if res["note_color"]["max"] is not None and res["note_color"]["max"] > TOL["note_color"]:
+        fails.append(f"note colour off by {res['note_color']['max']}/255")
+    if res["ink"]["width"] is not None and res["ink"]["width"] > TOL["ink_width"]:
+        fails.append(f"ink width off by {res['ink']['width']} px")
     if res["image"]["content"] is not None and res["image"]["content"] > TOL["image_content"]:
         fails.append(f"image content differs by {res['image']['content']}")
     res["fails"] = fails
@@ -406,11 +531,17 @@ def write_report(out_root: Path, results: list[dict]):
         if not v: return "<td>—</td>"
         if k == "text":
             return f"<td>{v['matched']}/{v['expected']} · median {v['median']} / max {v['max']}</td>"
+        if k == "note_color":
+            return f"<td>{v['max'] if v['max'] is not None else '—'}</td>"
+        if k == "ink" and not v["expected"] and not v["matched"]:
+            return "<td>—</td>"
+        if k == "ink":
+            return f"<td>{v['matched']}/{v['expected']} · max {v['max']} · width {v['width']}</td>"
         extra = f" · content {v['content']}" if v.get('content') is not None else ""
         return f"<td>{v['matched']}/{v['expected']}" + (f" · max {v['max']}" if v['max'] is not None else "") + extra + "</td>"
     rows = "".join(
         f"<tr class='{'bad' if r['status'] != 'PASS' else ''}'><td>{r['board']}</td><td>{r['fill']}</td><td>{r['status']}</td>"
-        + "".join(cell(r, k) for k in ("text", "image", "note", "shape", "arrow"))
+        + "".join(cell(r, k) for k in ("text", "image", "note", "note_color", "shape", "arrow", "ink"))
         + f"<td>{'; '.join(r.get('fails', []))}</td></tr>" for r in results)
     boards = sorted({r["board"] for r in results})
     figs = ""
@@ -427,9 +558,9 @@ th{{background:#f1eff6}} tr.bad td{{background:#fde8e8}} .grid{{display:grid;gri
 figure{{margin:0;background:#f1eff6;padding:6px;border-radius:6px}} img{{width:100%;background:#fff}}
 figcaption{{font-size:12px;color:#666;text-align:center}}</style></head><body>
 <h1>Whiteboard → IWB visual checks</h1>
-<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, image {TOL['image']}, note {TOL['note']}, shape {TOL['shape']}, arrowhead {TOL['arrow']}.
+<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, image {TOL['image']}, note {TOL['note']}, shape {TOL['shape']}, arrowhead {TOL['arrow']}, ink {TOL['ink']} (width {TOL['ink_width']}); note colour {TOL['note_color']}/255.
 Renders show the IWB page as a standard SVG renderer draws it (textarea as a wrapped text box).</p>
-<table><tr><th>Board</th><th>Notes</th><th>Status</th><th>Text</th><th>Images</th><th>Notes</th><th>Shapes</th><th>Arrowheads</th><th>Problems</th></tr>{rows}</table>
+<table><tr><th>Board</th><th>Notes</th><th>Status</th><th>Text</th><th>Images</th><th>Notes</th><th>Note colour</th><th>Shapes</th><th>Arrowheads</th><th>Ink</th><th>Problems</th></tr>{rows}</table>
 {figs}</body></html>"""
     (out_root / "report.html").write_text(doc, encoding="utf-8")
 
@@ -468,7 +599,7 @@ def main():
                     r.update(status="FAIL", fails=["conversion failed: " + log[-300:]]); results.append(r); continue
                 try:
                     out = measure_iwb(ipage, iwb, a.out / "shots" / f"{d.name}_{f}.png")
-                    r["checks"] = compare(src, out)
+                    r["checks"] = compare(src, out, solid_only=(f == "Solid"))
                     r["fails"] = r["checks"].pop("fails")
                     r["status"] = "FAIL" if r["fails"] else "PASS"
                 except Exception as e:
@@ -477,7 +608,8 @@ def main():
                 c = r.get("checks", {})
                 print(f"{d.name:26} {f:8} {r['status']:5}  text max {c.get('text', {}).get('max')}  "
                       f"image {c.get('image', {}).get('max')}  note {c.get('note', {}).get('max')}  shape {c.get('shape', {}).get('max')}  "
-                      f"arrow {c.get('arrow', {}).get('max')}  {'; '.join(r.get('fails', []))}", flush=True)
+                      f"arrow {c.get('arrow', {}).get('max')}  note colour {c.get('note_color', {}).get('max')}  "
+                      f"ink {c.get('ink', {}).get('max')}  {'; '.join(r.get('fails', []))}", flush=True)
         browser.close()
     (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
     write_report(a.out, results)

@@ -10,6 +10,9 @@ One-time setup for the Python/Playwright visual checks (tests\visual\run_visual_
 2. Creates a virtual environment in tests\.venv (git-ignored).
 3. Installs tests\visual\requirements.txt (Playwright) into it.
 4. Downloads Playwright's Chromium build (into %LOCALAPPDATA%\ms-playwright).
+5. Installs @excalidraw/utils into tests\visual\node_modules (git-ignored) with npm, so the
+   report can show each converted scene as Excalidraw draws it. Skipped, with a warning, when
+   Node.js isn't installed.
 
 Safe to re-run: existing pieces are reused.
 
@@ -45,7 +48,7 @@ function Find-Python {
     return $null
 }
 
-Write-Host '1/4 Looking for Python 3.9+ ...'
+Write-Host '1/5 Looking for Python 3.9+ ...'
 $python = Find-Python
 if (-not $python) {
     if (-not $InstallPython) {
@@ -66,7 +69,7 @@ if (-not $python) {
 }
 Write-Host ("    Using Python {0} ({1})" -f $python.Version, ($python.Command -join ' '))
 
-Write-Host "2/4 Virtual environment: $venv"
+Write-Host "2/5 Virtual environment: $venv"
 $venvPython = Join-Path $venv 'Scripts\python.exe'
 if (-not (Test-Path $venvPython)) {
     $exe = $python.Command[0]; $rest = @($python.Command | Select-Object -Skip 1)
@@ -74,14 +77,23 @@ if (-not (Test-Path $venvPython)) {
     if ($LASTEXITCODE -ne 0) { throw 'Creating the virtual environment failed.' }
 } else { Write-Host '    (already exists)' }
 
-Write-Host '3/4 Installing Python packages ...'
+Write-Host '3/5 Installing Python packages ...'
 & $venvPython -m pip install --disable-pip-version-check --upgrade pip | Out-Null
 & $venvPython -m pip install --disable-pip-version-check -r $requirements
 if ($LASTEXITCODE -ne 0) { throw 'pip install failed.' }
 
-Write-Host '4/4 Installing Playwright Chromium ...'
+Write-Host '4/5 Installing Playwright Chromium ...'
 & $venvPython -m playwright install chromium
 if ($LASTEXITCODE -ne 0) { throw 'Playwright browser install failed.' }
+
+Write-Host '5/5 Installing @excalidraw/utils (draws the Excalidraw pictures in the report) ...'
+if (Get-Command npm -ErrorAction SilentlyContinue) {
+    Push-Location (Join-Path $PSScriptRoot 'visual')
+    try { npm ci --no-audit --no-fund } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
+} else {
+    Write-Warning 'npm (Node.js) was not found: the checks still run, but the report will have no Excalidraw pictures.'
+}
 
 Write-Host ''
 Write-Host 'Done. Run the visual checks with:'
