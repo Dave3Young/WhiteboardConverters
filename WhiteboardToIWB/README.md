@@ -42,10 +42,11 @@ only if you're targeting another application.
 ## What gets converted
 | Whiteboard object | In the IWB file |
 | --- | --- |
-| Plain text | A text area, keeping line breaks, bold, alignment and rotation. The font is Arial. |
-| Sticky note | A filled rectangle (solid or banded) with its text, bold, in Segoe UI. |
+| Plain text | A text area, keeping line breaks, bold, alignment, rotation and the export's font (Arial or Segoe UI). |
+| Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text, in Segoe UI. |
 | Shape | A rectangle, or a polygon traced from Whiteboard's exact outline, so ovals stay round and rotated shapes stay rotated. Unfilled outlines that aren't rectangles are written as their edges. |
 | Connector | A line grouped with its arrowheads. Dashes are kept. |
+| Freehand ink | Each stroke as lines at the pen's width, grouped together. |
 | Reaction sticker | Whiteboard's original artwork, converted to PNG. |
 | Image | PNG, JPEG, GIF or BMP. WebP images are converted to PNG, and very large images are downscaled. |
 
@@ -59,7 +60,9 @@ The run summary reports these when they occur.
 - **Stickers kept as SVG:** without Edge/Chrome, or with `-NoRasterize`, stickers stay SVG.
   OpenBoard shows them, but other IWB apps may not, because SVG isn't a CFF image format.
 - **Rotated notes, images and stickers** are drawn unrotated. None of the samples has any.
-- **Formatting:** the original font face is dropped.
+- **Formatting:** note text is drawn in Segoe UI, not Whiteboard's Aptos.
+- **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
+  effect pen is approximated.
 - **Underline:** text keeps `text-decoration="underline"`, but OpenBoard's importer ignores it,
   so a single unrotated line also gets a drawn underline grouped with it. Wrapped or rotated
   underlined text has no drawn line, and the run summary says so.
@@ -74,6 +77,6 @@ The run summary reports these when they occur.
 .\tests\Invoke-VisualTests.ps1    # geometry and image content vs. Whiteboard's real layout
 ```
 
-- **Samples:** `samples\` holds 59 real Whiteboard exports.
+- **Samples:** `samples\` holds 60 real Whiteboard exports.
 - **Output:** converted files are written to `tests\out\solid` and `tests\out\gradient`.
 - **Visual tests:** the report is written to `tests\out\visual\report.html`.

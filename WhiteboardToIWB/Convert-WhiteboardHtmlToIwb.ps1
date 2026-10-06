@@ -40,7 +40,9 @@ that OpenBoard's CFF importer (src/adaptors/UBCFFSubsetAdaptor.cpp) reads correc
 
 Dashed strokes keep their stroke-dasharray (OpenBoard's importer draws them solid). Sticky
 notes are solid (the export's fallback background-color) or, with -NoteFill Gradient, a
-stack of -GradientSteps colour bands approximating the CSS linear-gradient.
+stack of -GradientSteps colour bands approximating the CSS linear-gradient at its angle.
+Freehand ink (InkGroup) becomes each stroke's centreline at the pen's width, as 2-point
+polylines grouped together.
 
 .EXAMPLE
 .\Convert-WhiteboardHtmlToIwb.ps1 -InputPath .\sailboat.html
@@ -120,6 +122,17 @@ begin {
     $NoteTextInsetTop  = 1
     $NoteTextColumnInset = 25
     $NoteFontFamily = 'Segoe UI'
+
+    # Whiteboard's newer note style (class "noteVisualUpdate" on .textBoxBackground, first seen
+    # in CompareAndContrast2) has no border, and puts a 40px author title bar
+    # (".titleBarWithAttribution { height: 40px }") above the CSS-sized text area: a 304 x 265
+    # note shows as 304 x 305, with its text 13px in and 40px down. Its colours are given only
+    # as a class (e.g. "paleGreenGradient"); see Get-NoteColorTable.
+    $NoteTitleBarHeight = 40
+
+    # Fill of a note whose colour can't be found (Whiteboard's default yellow); counted in the
+    # run summary.
+    $DefaultNoteFill = '#fee15a'
 
     # Plain text and shape labels are "sans-serif" in the export, which renders as Arial.
     $TextFontFamily = 'Arial'
@@ -355,25 +368,242 @@ begin {
     }
 
     function Get-RgbTriplet {
+        # rgb()/rgba() or #rgb/#rrggbb -> [r, g, b]; $null for anything else.
         param([string]$Color)
         $m = [regex]::Match($Color, 'rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
             [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if (-not $m.Success) { return $null }
         # Unary comma keeps the three values together as one return object.
-        return ,([int[]]@([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value))
+        if ($m.Success) { return ,([int[]]@([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value)) }
+        $m = [regex]::Match($Color, '#([0-9a-f]{6}|[0-9a-f]{3})\b', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $m.Success) { return $null }
+        $hex = $m.Groups[1].Value
+        if ($hex.Length -eq 3) { $hex = -join @($hex.ToCharArray() | ForEach-Object { "$_$_" }) }
+        return ,([int[]]@([Convert]::ToInt32($hex.Substring(0, 2), 16), [Convert]::ToInt32($hex.Substring(2, 2), 16),
+                          [Convert]::ToInt32($hex.Substring(4, 2), 16)))
+    }
+
+    function ConvertTo-HexColor {
+        param([int[]]$Rgb)
+        return '#{0:x2}{1:x2}{2:x2}' -f $Rgb[0], $Rgb[1], $Rgb[2]
     }
 
     function Get-LinearGradient {
+        # The first and last colour and the direction of the first CSS linear-gradient in
+        # $Style. Angle is in CSS degrees (0 = to top, 180 = to bottom, the default). A
+        # "to <corner>" gradient's angle depends on the box, so it is kept as Corner (x, y),
+        # with right/bottom = +1.
         param([string]$Style)
-        $gradient = Get-FirstMatch $Style 'linear-gradient\(([^)]*\([^)]*\)[^)]*\([^)]*\)[^)]*)\)'
+        $gradient = Get-FirstMatch $Style 'linear-gradient\(((?:[^()]|\([^()]*\))*)\)'
         if (-not $gradient) { return $null }
-        $colors = [regex]::Matches($gradient, 'rgba?\([^)]*\)',
+        $colors = [regex]::Matches($gradient, 'rgba?\([^)]*\)|#[0-9a-f]{3,8}\b',
             [Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if ($colors.Count -lt 2) { return $null }
         $start = Get-RgbTriplet $colors[0].Value
         $end = Get-RgbTriplet $colors[$colors.Count - 1].Value
         if ($null -eq $start -or $null -eq $end) { return $null }
-        return [pscustomobject]@{ Start = $start; End = $end }
+        $angle = 180.0; $corner = $null
+        $first = ($gradient -split ',')[0].Trim().ToLowerInvariant()
+        $m = [regex]::Match($first, '^([-+]?[0-9.]+)(deg|grad|rad|turn)$')
+        if ($m.Success) {
+            $v = Get-Number $m.Groups[1].Value 0
+            $angle = switch ($m.Groups[2].Value) { 'grad' { $v * 0.9 } 'rad' { $v * 180.0 / [Math]::PI } 'turn' { $v * 360.0 } default { $v } }
+        } elseif ($first -match '^to\s+(top|bottom|left|right)(?:\s+(top|bottom|left|right))?$') {
+            $sides = @(@($Matches[1], $Matches[2]) | Where-Object { $_ })
+            if ($sides.Count -eq 1) {
+                $angle = @{ top = 0.0; right = 90.0; bottom = 180.0; left = 270.0 }[$sides[0]]
+            } else {
+                $cx = if ($sides -contains 'right') { 1.0 } else { -1.0 }
+                $cy = if ($sides -contains 'bottom') { 1.0 } else { -1.0 }
+                $corner = [double[]]@($cx, $cy)
+            }
+        }
+        return [pscustomobject]@{ Start = $start; End = $end; Angle = $angle; Corner = $corner }
+    }
+
+    function Get-NoteColorTable {
+        # Colours of Whiteboard's newer note style, keyed by colour name ("paleGreen"), from the
+        # export's light-theme ":root { --noteBackgroundPaleGreenGradient: linear-gradient(...);
+        # --noteBackgroundPaleGreenColor: none; ... }" (".darkTheme:root" and ".highContrast:root"
+        # hold other themes). Solid is the Color property when it is a colour, else the
+        # gradient's end colour -- the colour the export's own forced-colors fallback uses.
+        param([string]$Html)
+        $opts = [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        $table = @{}
+        foreach ($root in [regex]::Matches($Html, '(?:^|[};>])\s*:root\s*\{([^}]*)\}', $opts)) {
+            foreach ($m in [regex]::Matches($root.Groups[1].Value, '--noteBackground([A-Za-z]+?)(Gradient|Color)\s*:\s*([^;]+)', $opts)) {
+                $name = $m.Groups[1].Value
+                if (-not $table.ContainsKey($name)) { $table[$name] = @{ Gradient = $null; Solid = $null } }
+                if ($m.Groups[2].Value -eq 'Gradient') {
+                    $g = Get-LinearGradient $m.Groups[3].Value
+                    if ($null -ne $g) { $table[$name].Gradient = $g }
+                } else {
+                    $rgb = Get-RgbTriplet $m.Groups[3].Value
+                    if ($null -ne $rgb) { $table[$name].Solid = ConvertTo-HexColor $rgb }
+                }
+            }
+        }
+        foreach ($entry in $table.Values) {
+            if (-not $entry.Solid -and $null -ne $entry.Gradient) { $entry.Solid = ConvertTo-HexColor $entry.Gradient.End }
+        }
+        return $table
+    }
+
+    function Get-NoteLayout {
+        # Box size, text inset and colours of one sticky note, in its local px. Classic notes
+        # have a 1px border outside their CSS size and inline background colours. Notes in the
+        # newer style ("noteVisualUpdate") have no border, may have an author title bar above
+        # the text area, and name their colour by class ("paleGreenGradient"), looked up in
+        # $NoteColors (Get-NoteColorTable). ColorFound is $false when the default fill is used.
+        param([string]$Block, [hashtable]$NoteColors)
+        $noteStyle = Get-FirstMatch $Block '<div[^>]*class="[^"]*\btextbox\s+stickyNote\b[^"]*"[^>]*style="([^"]*)"'
+        $bgTag = [string](Get-FirstMatch $Block '(<div[^>]*class="[^"]*\btextBoxBackground\b[^"]*"[^>]*>)')
+        $bgClass = [string](Get-FirstMatch $bgTag 'class="([^"]*)"')
+        $bgStyle = [string](Get-FirstMatch $bgTag 'style="([^"]*)"')
+        $cssW = Get-CssNumber $noteStyle 'width' 304; $cssH = Get-CssNumber $noteStyle 'height' 304
+        $border = if ($bgClass -match '\bnoteVisualUpdate\b') { 0.0 } else { [double]$NoteBorder }
+        $titleBar = if ($Block -match 'class="[^"]*\btitleBarWithAttribution\b') { [double]$NoteTitleBarHeight } else { 0.0 }
+        $solid = $null; $gradient = $null
+        $inline = Get-StyleValue $bgStyle 'background-color'
+        if ($inline) {
+            $solid = Convert-RgbaToHex $inline $DefaultNoteFill
+            $gradient = Get-LinearGradient $bgStyle
+        } else {
+            $name = Get-FirstMatch $bgClass '\b([a-z]+)Gradient\b'
+            if ($name -and $NoteColors.ContainsKey($name)) {
+                $solid = $NoteColors[$name].Solid; $gradient = $NoteColors[$name].Gradient
+            }
+        }
+        return [pscustomobject]@{
+            CssWidth = $cssW; CssHeight = $cssH
+            Width = $cssW + (2 * $border); Height = $cssH + $titleBar + (2 * $border)
+            # The 12px side padding plus Draft.js's 1px gutter, inside the border and title bar.
+            TextLeft = $border + ($NoteTextInsetLeft - $NoteBorder); TextTop = $border + $titleBar + ($NoteTextInsetTop - $NoteBorder)
+            Border = $border
+            Solid = $(if ($solid) { $solid } else { $DefaultNoteFill }); Gradient = $gradient; ColorFound = [bool]$solid
+        }
+    }
+
+    function Get-ClippedPolygon {
+        # The part of convex polygon $Points whose distance along the unit vector ($DX, $DY),
+        # measured from ($CX, $CY), lies between $From and $To (Sutherland-Hodgman, two edges).
+        param([double[][]]$Points, [double]$CX, [double]$CY, [double]$DX, [double]$DY, [double]$From, [double]$To)
+        $poly = $Points
+        foreach ($edge in @(@(1.0, $From), @(-1.0, (-$To)))) {
+            $out = New-Object Collections.Generic.List[double[]]
+            $n = $poly.Count
+            for ($i = 0; $i -lt $n; $i++) {
+                $p = $poly[$i]; $q = $poly[($i + 1) % $n]
+                $sp = ($edge[0] * ((($p[0] - $CX) * $DX) + (($p[1] - $CY) * $DY))) - $edge[1]
+                $sq = ($edge[0] * ((($q[0] - $CX) * $DX) + (($q[1] - $CY) * $DY))) - $edge[1]
+                if ($sp -ge 0) { [void]$out.Add($p) }
+                if (($sp -ge 0) -ne ($sq -ge 0)) {
+                    $k = $sp / ($sp - $sq)
+                    [void]$out.Add([double[]]@(($p[0] + (($q[0] - $p[0]) * $k)), ($p[1] + (($q[1] - $p[1]) * $k))))
+                }
+            }
+            $poly = $out.ToArray()
+            if ($poly.Count -eq 0) { break }
+        }
+        return ,$poly
+    }
+
+    function Get-GradientBands {
+        # Splits a $Width x $Height box (local px, origin at its corner) into $Steps colour
+        # bands across a CSS linear-gradient (Get-LinearGradient): band i covers gradient
+        # positions i/Steps .. (i+1)/Steps, clipped to the box, and is coloured from the start
+        # colour (i = 0) to the end colour. As CSS defines it, the gradient line runs through
+        # the box centre at the gradient's angle and is |W sin a| + |H cos a| long. Each band
+        # but the last reaches half a band into the next, which is drawn over it: a thinner
+        # overlap (0.15 px) let anti-aliasing show white seams along angled band edges. At 180 degrees (classic notes) the bands are plain horizontal strips; newer
+        # notes use 155 degrees.
+        param([double]$Width, [double]$Height, $Gradient, [int]$Steps)
+        if ($null -ne $Gradient.Corner) {
+            # "to <corner>": perpendicular to the diagonal through the two other corners.
+            $dx = $Gradient.Corner[0] * $Height; $dy = $Gradient.Corner[1] * $Width
+        } else {
+            $rad = $Gradient.Angle * [Math]::PI / 180.0
+            $dx = [Math]::Sin($rad); $dy = -[Math]::Cos($rad)
+        }
+        $len = [Math]::Sqrt(($dx * $dx) + ($dy * $dy)); $dx = $dx / $len; $dy = $dy / $len
+        # sin(180 deg) is 1.2e-16, not 0: snap it so axis-aligned bands stay exact rectangles.
+        if ([Math]::Abs($dx) -lt 1e-9) { $dx = 0.0 }
+        if ([Math]::Abs($dy) -lt 1e-9) { $dy = 0.0 }
+        $lineLength = [Math]::Abs($Width * $dx) + [Math]::Abs($Height * $dy)
+        $box = [double[][]]@(@(0.0, 0.0), @($Width, 0.0), @($Width, $Height), @(0.0, $Height))
+        $bands = New-Object Collections.Generic.List[object]
+        for ($i = 0; $i -lt $Steps; $i++) {
+            $ratio = if ($Steps -le 1) { 0.0 } else { [double]$i / [double]($Steps - 1) }
+            $rgb = for ($c = 0; $c -lt 3; $c++) {
+                [int][Math]::Round($Gradient.Start[$c] + (($Gradient.End[$c] - $Gradient.Start[$c]) * $ratio))
+            }
+            $from = (([double]$i / $Steps) - 0.5) * $lineLength
+            $to = ((([double]$i + 1) / $Steps) - 0.5) * $lineLength
+            if ($i -lt $Steps - 1) { $to += 0.5 * $lineLength / $Steps }
+            $poly = Get-ClippedPolygon $box ($Width / 2) ($Height / 2) $dx $dy $from $to
+            if ($poly.Count -ge 3) { [void]$bands.Add([pscustomobject]@{ Points = $poly; Color = (ConvertTo-HexColor $rgb) }) }
+        }
+        return ,($bands.ToArray())
+    }
+
+    function Get-InkStrokes {
+        # The strokes of an InkGroup (freehand ink), in board px. Whiteboard draws each stroke
+        # as a filled outline <path> inside <g class="inkStroke" transform="matrix(...)"> (in
+        # 1/128 px), and also stores its centreline as the invisible hit-test
+        # <polyline class="inkHitTestOverlay">. The outline is that centreline widened by the
+        # pen radius -- its round joins and caps are arcs of exactly that radius -- so the
+        # centreline drawn round-capped at twice the arc radius is the same stroke. Exact is
+        # $false when that doesn't hold: no arcs, arcs of varying radius (a pressure-sensitive
+        # pen), or a fill that isn't a plain opaque colour (e.g. the rainbow pen).
+        param($Anchor, [string]$Block)
+        $opts = [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Singleline
+        $numRx = '[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+        $svgTag = [string](Get-FirstMatch $Block '(<svg\b[^>]*>)')
+        $vb = @([regex]::Matches([string](Get-FirstMatch $svgTag '\bviewBox="([^"]*)"'), $numRx) | ForEach-Object { Get-Number $_.Value 0 })
+        $sx = 1.0; $sy = 1.0; $vx = 0.0; $vy = 0.0
+        if ($vb.Count -eq 4 -and $vb[2] -gt 0 -and $vb[3] -gt 0) {
+            $vx = $vb[0]; $vy = $vb[1]
+            $sx = (Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') $vb[2]) / $vb[2]
+            $sy = (Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') $vb[3]) / $vb[3]
+        }
+        $strokes = New-Object Collections.Generic.List[object]
+        foreach ($g in [regex]::Matches($Block, '(<g\b[^>]*\bclass="[^"]*\binkStroke\b[^"]*"[^>]*>)(.*?)</g>', $opts)) {
+            $m = @(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            $gm = @([regex]::Matches([string](Get-FirstMatch $g.Groups[1].Value '\btransform="\s*matrix\(([^)]*)\)'), $numRx) | ForEach-Object { Get-Number $_.Value 0 })
+            if ($gm.Count -eq 6) { $m = $gm }
+            $pathTag = [string](Get-FirstMatch $g.Groups[2].Value '(<path\b[^>]*>)')
+            $d = [string](Get-FirstMatch $pathTag '\sd="([^"]*)"')
+            $nums = @([regex]::Matches([string](Get-FirstMatch $g.Groups[2].Value '<polyline\b[^>]*\bpoints="([^"]*)"'), $numRx) | ForEach-Object { Get-Number $_.Value 0 })
+            if ($nums.Count -lt 4) { continue }
+            $pts = New-Object Collections.Generic.List[double[]]
+            for ($k = 0; $k + 1 -lt $nums.Count; $k += 2) {
+                # g matrix, then the svg viewBox, then the anchor's own matrix.
+                $u = ((($m[0] * $nums[$k]) + ($m[2] * $nums[$k + 1]) + $m[4]) - $vx) * $sx
+                $v = ((($m[1] * $nums[$k]) + ($m[3] * $nums[$k + 1]) + $m[5]) - $vy) * $sy
+                [void]$pts.Add([double[]]@(($Anchor.X + ($Anchor.MA * $u) + ($Anchor.MC * $v)),
+                                           ($Anchor.Y + ($Anchor.MB * $u) + ($Anchor.MD * $v))))
+            }
+            $radii = @([regex]::Matches($d, "[Aa]\s*($numRx)[\s,]+($numRx)") | ForEach-Object { Get-Number $_.Groups[1].Value 0 } | Sort-Object)
+            $exact = $true
+            if ($radii.Count -gt 0) {
+                $radius = $radii[[int][Math]::Floor($radii.Count / 2)]
+                if (($radii[$radii.Count - 1] - $radii[0]) -gt (0.05 * $radius)) { $exact = $false }
+            } else {
+                $radius = 256.0; $exact = $false   # 2 px at Whiteboard's 1/128 px scale
+            }
+            $scale = [Math]::Sqrt([Math]::Abs((($m[0] * $m[3]) - ($m[1] * $m[2])) * $sx * $sy *
+                                              (($Anchor.MA * $Anchor.MD) - ($Anchor.MB * $Anchor.MC))))
+            $fill = [string](Get-FirstMatch $pathTag '\bfill="([^"]*)"')
+            $alpha = Get-FirstMatch $fill 'rgba\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\s*\)'
+            $opacity = Get-FirstMatch $pathTag '\bopacity="([0-9.]+)"'
+            if ($fill -match '^\s*url\(' -or -not (Get-RgbTriplet $fill) -or ($alpha -and (Get-Number $alpha 1) -lt 1) -or ($opacity -and (Get-Number $opacity 1) -lt 1)) {
+                $exact = $false
+            }
+            [void]$strokes.Add([pscustomobject]@{
+                Points = $pts.ToArray(); Width = 2 * $radius * $scale
+                Color = (Convert-RgbaToHex $fill '#1f1f1f'); Exact = $exact
+            })
+        }
+        return ,($strokes.ToArray())
     }
 
     # ===================================================================================
@@ -585,6 +815,18 @@ begin {
             Text = $Text; M11 = $M11; M12 = $M12; M21 = $M21; M22 = $M22; Group = $Group
             Underline = $Underline
         })
+    }
+
+    function Get-FontFamily {
+        # The first family of an inline CSS font-family list. Older exports' plain text is
+        # "sans-serif, "Segoe UI"", and the generic sans-serif renders as Arial; newer exports
+        # (CompareAndContrast2) name "Segoe UI" itself, which is wider -- drawing it in Arial
+        # moved centred labels up to 21px.
+        param([string]$Style, [string]$Default = 'Arial')
+        $v = "$(Get-StyleValue ([Net.WebUtility]::HtmlDecode($Style)) 'font-family')"
+        $first = ($v -split ',')[0].Trim().Trim([char[]]@([char]34, [char]39)).Trim()
+        if (-not $first -or $first -eq 'sans-serif') { return $Default }
+        return $first
     }
 
     function Test-Underline {
@@ -996,7 +1238,9 @@ begin {
                 }
                 'Text' {
                     $fontPt = Format-Number ($g.FontSize * $s * 0.75)
-                    $weight = if ($g.Weight -ge 600) { 'bold' } else { 'normal' }
+                    # OpenBoard maps only weight names; 600 (Whiteboard's headings) is demibold, which
+                    # matters for faces with a semibold, e.g. Segoe UI: drawn bold, centred labels moved 8px.
+                    $weight = if ($g.Weight -ge 700) { 'bold' } elseif ($g.Weight -ge 600) { 'demibold' } else { 'normal' }
                     $align = switch ($g.Align) { 'center' { 'center' } 'right' { 'end' } default { 'start' } }
                     $angle = [Math]::Atan2($g.M12, $g.M11) * 180.0 / [Math]::PI
                     if ([Math]::Abs($angle) -gt 0.001) {
@@ -1087,16 +1331,18 @@ begin {
         $rotatedTextCount = 0; $rotatedShapeCount = 0; $rotationIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
         $groupNumber = 0
-
+        $noteColors = Get-NoteColorTable $html
+        $noteColorMissing = [Collections.Generic.List[string]]::new()
+        $inkStrokeCount = 0; $inkApproximated = 0
         foreach ($block in $blocks) {
             $a = Get-AnchorInfo $block
             if (-not $a.Type) { continue }
             if (-not $sourceTypes.ContainsKey($a.Type)) { $sourceTypes[$a.Type] = 0 }
             $sourceTypes[$a.Type]++
-            # PlainText and shapes keep their rotation; other rotated objects keep their size but
-            # are drawn unrotated -- counted so the summary can say so.
+            # PlainText, shapes and ink keep their rotation; other rotated objects keep their size
+            # but are drawn unrotated -- counted so the summary can say so.
             if ($a.IsRotated -and $a.Type -eq 'Shape') { $rotatedShapeCount++ }
-            elseif ($a.IsRotated -and $a.Type -ne 'PlainText') { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
+            elseif ($a.IsRotated -and $a.Type -notin 'PlainText','InkGroup') { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
             $groupNumber++
             $group = 'g' + $groupNumber
 
@@ -1147,15 +1393,16 @@ begin {
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
                         $shapeWeight = Get-FontWeight $shapeCoreStyle 700
                         $shapeUnderline = Test-Underline $shapeCoreStyle
+                        $shapeFamily = Get-FontFamily $shapeCoreStyle $TextFontFamily
                         # The text box turns with the shape.
                         Add-IwbText $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) ($textHeight * $a.ScaleY) `
                             ($fontLocal * $a.ScaleY) $textColor $textAlign `
                             ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) `
-                            -Weight $shapeWeight -Group $group -Underline $shapeUnderline
+                            -Weight $shapeWeight -Family $shapeFamily -Group $group -Underline $shapeUnderline
                         if ($a.IsRotated) { $rotatedTextCount++ }
                         if ($shapeUnderline) {
                             if (-not $a.IsRotated -and (Add-IwbUnderline $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) `
-                                    ($fontLocal * $a.ScaleY) $textColor $textAlign $shapeWeight $TextFontFamily $group)) { $underlineDrawn++ }
+                                    ($fontLocal * $a.ScaleY) $textColor $textAlign $shapeWeight $shapeFamily $group)) { $underlineDrawn++ }
                             else { $underlineNotDrawn++ }
                         }
                     }
@@ -1177,6 +1424,7 @@ begin {
                     $width *= $a.ScaleX
                     $weight = Get-FontWeight $coreStyle 400
                     $underline = Test-Underline $coreStyle
+                    $family = Get-FontFamily $coreStyle $TextFontFamily
                     # Plain text is grouped only with a drawn underline.
                     $textGroup = if ($underline) { $group } else { $null }
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
@@ -1189,13 +1437,13 @@ begin {
                         $rotatedTextCount++
                         Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align `
                             ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight `
-                            -Group $textGroup -Underline $underline
+                            -Family $family -Group $textGroup -Underline $underline
                         if ($underline) { $underlineNotDrawn++ }
                     } else {
                         Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align -Weight $weight `
-                            -Group $textGroup -Underline $underline
+                            -Family $family -Group $textGroup -Underline $underline
                         if ($underline) {
-                            if (Add-IwbUnderline $graphics $text $textX $textY $width $font $color $align $weight $TextFontFamily $group) { $underlineDrawn++ }
+                            if (Add-IwbUnderline $graphics $text $textX $textY $width $font $color $align $weight $family $group) { $underlineDrawn++ }
                             else { $underlineNotDrawn++ }
                         }
                     }
@@ -1203,41 +1451,50 @@ begin {
                 'Note' {
                     $text = Get-HtmlText $block
                     $noteStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+stickyNote\b[^"]*"[^>]*style="([^"]*)"'
-                    $backgroundStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxBackground\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
-                    $cssW = Get-CssNumber $noteStyle 'width' 304; $cssH = Get-CssNumber $noteStyle 'height' 304
-                    $w = ($cssW + (2 * $NoteBorder)) * $a.ScaleX
-                    $h = ($cssH + (2 * $NoteBorder)) * $a.ScaleY
-                    $bg = Convert-RgbaToHex (Get-StyleValue $backgroundStyle 'background-color') '#fee15a'
+                    $note = Get-NoteLayout $block $noteColors
+                    if (-not $note.ColorFound) { [void]$noteColorMissing.Add("$($a.Type):$($a.Key)") }
+                    $cssW = $note.CssWidth; $cssH = $note.CssHeight
+                    $w = $note.Width * $a.ScaleX
+                    $h = $note.Height * $a.ScaleY
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
-                    $gradient = if ($NoteFill -eq 'Gradient') { Get-LinearGradient $backgroundStyle } else { $null }
+                    $gradient = if ($NoteFill -eq 'Gradient') { $note.Gradient } else { $null }
                     if ($null -ne $gradient) {
-                        # Colour bands from the gradient's start to its end colour; each overlaps
-                        # the next slightly so no hairline gaps show between them.
-                        $bandHeight = $h / $GradientSteps
-                        for ($i = 0; $i -lt $GradientSteps; $i++) {
-                            $ratio = if ($GradientSteps -le 1) { 0.0 } else { [double]$i / [double]($GradientSteps - 1) }
-                            $rgb = for ($c = 0; $c -lt 3; $c++) { [int][Math]::Round($gradient.Start[$c] + (($gradient.End[$c] - $gradient.Start[$c]) * $ratio)) }
-                            $band = '#{0:x2}{1:x2}{2:x2}' -f $rgb[0], $rgb[1], $rgb[2]
-                            $bandH = if ($i -lt $GradientSteps - 1) { $bandHeight + 0.15 } else { $bandHeight }
-                            Add-IwbRect $graphics $a.X ($a.Y + ($i * $bandHeight)) $w $bandH $band $null 0 $null $group
+                        # Colour bands across the gradient (Get-GradientBands): a horizontal strip
+                        # (classic notes) is a rect, a band across an angled gradient a polygon.
+                        foreach ($band in (Get-GradientBands $note.Width $note.Height $gradient $GradientSteps)) {
+                            $pts = @($band.Points | ForEach-Object { ,([double[]]@(($a.X + ($_[0] * $a.ScaleX)), ($a.Y + ($_[1] * $a.ScaleY)))) })
+                            $box = Get-AxisAlignedBox $pts
+                            if ($null -ne $box) { Add-IwbRect $graphics $box.X $box.Y $box.W $box.H $band.Color $null 0 $null $group }
+                            else { Add-IwbPolygon $graphics $pts $band.Color $null 0 $null $group }
                         }
                     } else {
-                        Add-IwbRect $graphics $a.X $a.Y $w $h $bg $null 0 $null $group
+                        Add-IwbRect $graphics $a.X $a.Y $w $h $note.Solid $null 0 $null $group
                     }
                     if ($text.Trim()) {
                         $noteFont = Get-CssNumber $noteStyle 'font-size' 24
                         $noteWeight = Get-FontWeight $coreStyle 700
                         $noteUnderline = Test-Underline $coreStyle
-                        $noteTextX = $a.X + ($NoteTextInsetLeft * $a.ScaleX); $noteTextY = $a.Y + ($NoteTextInsetTop * $a.ScaleY)
+                        $noteTextX = $a.X + ($note.TextLeft * $a.ScaleX); $noteTextY = $a.Y + ($note.TextTop * $a.ScaleY)
                         $noteTextW = ($cssW - $NoteTextColumnInset) * $a.ScaleX
-                        Add-IwbText $graphics $text $noteTextX $noteTextY $noteTextW (($cssH - $NoteTextInsetTop - 12) * $a.ScaleY) `
+                        Add-IwbText $graphics $text $noteTextX $noteTextY $noteTextW (($cssH - $note.Border - 12) * $a.ScaleY) `
                             ($noteFont * $a.ScaleY) $color 'left' -Weight $noteWeight -Family $NoteFontFamily -Group $group -Underline $noteUnderline
                         if ($noteUnderline) {
                             if (Add-IwbUnderline $graphics $text $noteTextX $noteTextY $noteTextW ($noteFont * $a.ScaleY) $color 'left' `
                                     $noteWeight $NoteFontFamily $group) { $underlineDrawn++ }
                             else { $underlineNotDrawn++ }
                         }
+                    }
+                }
+                'InkGroup' {
+                    $strokes = @(Get-InkStrokes $a $block)
+                    if ($strokes.Count -eq 0) { [void]$unsupported.Add("$($a.Type):$($a.Key) (no ink strokes)"); break }
+                    # Each stroke's centreline as round-capped 2-point polylines (the only line
+                    # OpenBoard's importer draws), all in the object's group.
+                    foreach ($s in $strokes) {
+                        Add-IwbPolyline $graphics $s.Points -Stroke $s.Color -StrokeWidth $s.Width -Group $group
+                        $inkStrokeCount++
+                        if (-not $s.Exact) { $inkApproximated++ }
                     }
                 }
                 'Connector' {
@@ -1409,6 +1666,8 @@ begin {
             RotationIgnored = $rotationIgnored.Count; RotationIgnoredDetails = @($rotationIgnored)
             ArrowheadsConverted = $arrowheadCount
             UnderlinesDrawn = $underlineDrawn; UnderlinesNotDrawn = $underlineNotDrawn
+            NoteColorMissing = $noteColorMissing.Count; NoteColorMissingDetails = @($noteColorMissing)
+            InkStrokes = $inkStrokeCount; InkApproximated = $inkApproximated
         }
     }
 }
@@ -1463,6 +1722,16 @@ process {
         }
         if ($result.DashedStrokes -gt 0) {
             Write-Host ("  {0} dashed stroke(s) kept as dashes (OpenBoard's IWB import draws them solid)." -f $result.DashedStrokes)
+        }
+        if ($result.InkStrokes -gt 0) {
+            Write-Host ("  {0} ink stroke(s) converted." -f $result.InkStrokes)
+        }
+        if ($result.InkApproximated -gt 0) {
+            Write-Warning ("{0} ink stroke(s) were drawn at one width in one solid colour, which differs from the original (a pressure-sensitive, translucent or effect pen)." -f $result.InkApproximated)
+        }
+        if ($result.NoteColorMissing -gt 0) {
+            Write-Warning ("{0} sticky note(s) had no colour this script could find and were drawn in the default yellow: {1}" -f `
+                $result.NoteColorMissing, ($result.NoteColorMissingDetails -join ', '))
         }
         if ($result.UnderlinesDrawn -gt 0) {
             Write-Host ("  {0} underlined text(s) also given a drawn underline (OpenBoard's IWB import ignores text-decoration)." -f $result.UnderlinesDrawn)
