@@ -16,7 +16,7 @@ Converts every Microsoft Whiteboard HTML export under samples\ with Convert-Whit
   OpenBoard  - only the element forms OpenBoard's CFF importer reads correctly: rect, polygon,
                2-point polyline, textarea (with tbreak), image; every shape has an explicit
                stroke colour; polygons have a real fill; font sizes are in pt and weights are
-               normal/bold; numbers have no exponents; a text transform is exactly
+               normal/demibold/bold; numbers have no exponents; a text transform is exactly
                "translate(x,y) rotate(a)".
   Content    - every PlainText string from the export appears verbatim in a textarea (line
                breaks as <svg:tbreak/>); no "?" fallback glyphs; every Shape traced from its
@@ -222,7 +222,7 @@ function Test-Iwb {
                 'textarea' {
                     $x = & $num $el 'x'; $y = & $num $el 'y'; [void](& $num $el 'width'); [void](& $num $el 'height')
                     if ($el.GetAttribute('font-size') -notmatch '^\d+(\.\d+)?pt$') { Add-Issue 'FAIL' "<textarea id=$id> font-size '$($el.GetAttribute('font-size'))' is not in pt" }
-                    if ($el.GetAttribute('font-weight') -notin 'normal', 'bold') { Add-Issue 'FAIL' "<textarea id=$id> font-weight '$($el.GetAttribute('font-weight'))' (OpenBoard maps only names)" }
+                    if ($el.GetAttribute('font-weight') -notin 'normal', 'demibold', 'bold') { Add-Issue 'FAIL' "<textarea id=$id> font-weight '$($el.GetAttribute('font-weight'))' (OpenBoard maps only names)" }
                     if ($el.GetAttribute('text-align') -notin 'start', 'center', 'end') { Add-Issue 'FAIL' "<textarea id=$id> text-align '$($el.GetAttribute('text-align'))'" }
                     $tr = $el.GetAttribute('transform')
                     if ($tr) {

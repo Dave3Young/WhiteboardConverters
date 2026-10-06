@@ -1,0 +1,8 @@
+{
+  "name": "whiteboard-to-excalidraw-visual-checks",
+  "private": true,
+  "description": "Excalidraw's exporter, used by run_visual_checks.py to draw converted scenes for the report.",
+  "dependencies": {
+    "@excalidraw/utils": "0.1.5"
+  }
+}

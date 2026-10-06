@@ -106,8 +106,7 @@ Each folder has its own `samples\` (59 real Whiteboard exports) and two test sui
 .\tests\Invoke-VisualTests.ps1    # compares geometry against Whiteboard's real layout
 ```
 
-The visual tests write an HTML report to `tests\out\visual\report.html`. Each folder's
-`CLAUDE.md`, where present, documents the source and target formats in detail.
+The visual tests write an HTML report to `tests\out\visual\report.html`.
 
 ## License
 [GPL-3.0](LICENSE)

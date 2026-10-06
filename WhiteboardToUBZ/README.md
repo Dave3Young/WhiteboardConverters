@@ -38,10 +38,11 @@ Open the `.ubz` in [OpenBoard](https://openboard.ch/).
 ## What gets converted
 | Whiteboard object | In OpenBoard |
 | --- | --- |
-| Plain text | Editable text, keeping line breaks, bold, alignment and rotation. The font is Arial. |
-| Sticky note | A filled square (solid or banded) with its text, 24 px bold. |
+| Plain text | Editable text, keeping line breaks, bold, alignment, rotation and the export's font (Arial or Segoe UI). |
+| Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text. |
 | Shape | A fill and border traced from Whiteboard's exact outline and grouped together. Ovals stay round, and rotated shapes stay rotated. |
 | Connector | A line grouped with its arrowheads. |
+| Freehand ink | Each stroke as a line at the pen's width, grouped together. |
 | Reaction sticker | Whiteboard's original vector artwork (SVG). |
 | Image | The embedded image. Very large images are downscaled. |
 
@@ -50,7 +51,9 @@ The run summary reports every item below when it occurs.
 - **Dashed lines** are drawn solid, because OpenBoard has no dashed ink style.
 - **Rotated notes, images and stickers** are drawn unrotated at the right size. None of the
   samples has any.
-- **Formatting:** underline and the original font face are dropped.
+- **Formatting:** note text is drawn in Arial, not Whiteboard's Aptos. Underline is kept.
+- **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
+  effect pen is approximated.
 - **Unverified cases:** there are no samples of text inside shapes, or of elbow or curved
   connectors.
 
@@ -61,8 +64,8 @@ The run summary reports every item below when it occurs.
 .\tests\Invoke-VisualTests.ps1    # geometry vs. Whiteboard's real layout
 ```
 
-- **Samples:** `samples\` holds 59 real Whiteboard exports.
+- **Samples:** `samples\` holds 60 real Whiteboard exports.
 - **Visual tests:** they measure the original board in headless Chromium and compare every
-  text, note, shape, sticker and arrowhead position with the converted file. The report is
+  text, note, shape, sticker, arrowhead and ink stroke position, and every note's colour, with
+  the converted file. The report is
   written to `tests\out\visual\report.html`.
-- **Format notes:** [CLAUDE.md](CLAUDE.md) documents both file formats in detail.

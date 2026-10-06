@@ -6,15 +6,20 @@ For every sample export and both converter scripts this:
      change is one printed line recording the scene's normalisation offset, so board
      coordinates can be recovered exactly -- the scripts in the repo are never modified);
   2. renders the Whiteboard HTML in headless Chromium and measures where Whiteboard really
-     puts every text, sticker, note, image, shape outline, connector and arrowhead;
+     puts every text, sticker, note, image, shape outline, connector, arrowhead and ink stroke,
+     and which colours it paints each note;
   3. reads the .excalidraw scene and places the same things the way Excalidraw does (text
      is laid out in Chromium with Excalidraw's font size, line height, width and alignment,
      and -- like Excalidraw -- never re-wrapped: a line wider than its element is clipped in
      Excalidraw, so it fails the check);
-  4. writes tests/out/visual/results.json and exits non-zero if any tolerance is exceeded.
+  4. draws the scene with Excalidraw's own exporter, for the report only;
+  5. writes tests/out/visual/report.html (side-by-side pictures + accuracy tables) and
+     results.json, and exits non-zero if any tolerance is exceeded.
 
-Only dependency: Playwright (pip install playwright; python -m playwright install chromium).
-Run tests/Setup-VisualTests.ps1 once to set that up in tests/.venv.
+Dependencies: Playwright (pip install playwright; python -m playwright install chromium), and
+for the Excalidraw pictures @excalidraw/utils in tests/visual/node_modules (npm ci in
+tests/visual). Run tests/Setup-VisualTests.ps1 once to set both up. Without @excalidraw/utils
+the checks still run and the report shows only the Whiteboard pictures.
 
 Usage (from the repo root):
     tests\\.venv\\Scripts\\python tests\\visual\\run_visual_checks.py
@@ -23,6 +28,7 @@ Usage (from the repo root):
 from __future__ import annotations
 
 import argparse
+import html as htmllib
 import json
 import math
 import platform
@@ -30,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -38,7 +45,11 @@ REPO = Path(__file__).resolve().parents[2]
 VERSIONS = ("solid", "gradient")
 
 # Pass/fail tolerances in board pixels.
-TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "image": 0.5, "shape": 1.5, "connector": 0.5, "arrow": 0.5}
+TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "image": 0.5, "shape": 1.5, "connector": 0.5, "arrow": 0.5,
+       "ink": 0.5, "ink_width": 0.1}
+# Largest channel difference (0-255) between Whiteboard's and the scene's note colour, at five
+# points of each note.
+NOTE_COLOR_TOL = 3.0
 ARROW_ANGLE_TOL = 2.0   # degrees between Whiteboard's chevron axis and the arrow's end segment
 TEXT_CLIP_TOL = 1.0     # px a text line may extend past its element's width before Excalidraw clips it
 
@@ -99,6 +110,7 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path):
 # ----------------------------------------------------------------------------------------
 JS_HTML = r"""() => {
   const cal = [], texts = [], stickers = [], shapes = [], arrows = [], connectors = [], notes = [], images = [];
+  const noteStyles = [], inks = [];
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   const box = r => [r.left + scrollX, r.top + scrollY, r.width, r.height];
   document.querySelectorAll('div.anchor[data-whiteboard-type]').forEach(a => {
@@ -127,7 +139,21 @@ JS_HTML = r"""() => {
     }
     if (type === 'ReactionStickers') stickers.push(box(a.querySelector('img').getBoundingClientRect()));
     if (type === 'Image' || type === 'AzureImage') images.push(box(a.querySelector('img').getBoundingClientRect()));
-    if (type === 'Note') notes.push(box(a.querySelector('.textBoxBackground').getBoundingClientRect()));
+    if (type === 'Note') {
+      const bg = a.querySelector('.textBoxBackground'), cs = getComputedStyle(bg);
+      notes.push(box(bg.getBoundingClientRect()));
+      noteStyles.push({color: cs.backgroundColor, image: cs.backgroundImage});
+    }
+    // Ink: each stroke's centreline (the hidden hit-test polyline) and its pen width, twice
+    // the radius of the round joins in the visible outline path.
+    if (type === 'InkGroup') a.querySelectorAll('g.inkStroke').forEach(g => {
+      const pl = g.querySelector('polyline'), p = g.querySelector('path');
+      if (!pl) return;
+      const m = pl.getScreenCTM(), n = pl.points.numberOfItems, pts = [];
+      for (let i = 0; i < n; i++) { const q = pl.points.getItem(i); pts.push(pt(m, q.x, q.y)); }
+      const r = /[Aa]\s*([\d.]+)/.exec(p ? p.getAttribute('d') : '');
+      inks.push({pts, w: r ? 2 * r[1] * Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) : null});
+    });
     if (type === 'Shape') {
       const svg = a.querySelector('svg.shape'), p = svg && svg.querySelector('g > path');
       if (p) {
@@ -148,7 +174,13 @@ JS_HTML = r"""() => {
       });
     }
   });
-  return {cal, texts, stickers, shapes, arrows, connectors, notes, images};
+  // The anchor divs themselves are 0 x 0 (their content overflows them), so take the union
+  // of everything drawn inside them; comment threads are not board objects.
+  const all = [...document.querySelectorAll('div.anchor[data-whiteboard-type]:not([data-whiteboard-type=CommentThread]) *')]
+              .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
+  const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
+                             Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
+  return {cal, texts, stickers, shapes, arrows, connectors, notes, images, noteStyles, inks, bbox};
 }"""
 
 
@@ -159,13 +191,17 @@ def linfit(xs, ys):
     return k, my - k * mx
 
 
-def measure_html(page, html: Path) -> dict:
+def measure_html(page, html: Path, shot: Path) -> dict:
     page.goto(html.as_uri()); page.wait_for_timeout(1200)
     d = page.evaluate(JS_HTML)
     if len(d["cal"]) < 2:
         raise RuntimeError("fewer than 2 untransformed anchors; can't map screen to board coordinates")
     kx, ox = linfit([c[0] for c in d["cal"]], [c[2] for c in d["cal"]])
     ky, oy = linfit([c[1] for c in d["cal"]], [c[3] for c in d["cal"]])
+    if d["bbox"]:
+        x0, y0, x1, y1 = d["bbox"]; pad = 12
+        page.screenshot(path=str(shot), full_page=True,
+                        clip={"x": max(0, x0 - pad), "y": max(0, y0 - pad), "width": x1 - x0 + 2 * pad, "height": y1 - y0 + 2 * pad})
     to_b = lambda x, y: ((x - ox) / kx, (y - oy) / ky)
     to_box = lambda b: (*to_b(b[0], b[1]), b[2] / kx, b[3] / ky)
     return {
@@ -177,7 +213,76 @@ def measure_html(page, html: Path) -> dict:
         "shapes": [{"label": s["label"], "pts": [to_b(*q) for q in s["pts"]]} for s in d["shapes"]],
         "connectors": [[to_b(*q) for q in c] for c in d["connectors"]],
         "arrows": [[to_b(*q) for q in a] for a in d["arrows"]],
+        "note_paints": [note_paint(s) for s in d["noteStyles"]],
+        "inks": [{"pts": [to_b(*q) for q in s["pts"]], "w": s["w"] / kx if s["w"] else None} for s in d["inks"]],
     }
+
+
+def parse_rgbs(s: str) -> list[tuple]:
+    return [tuple(int(v) for v in m) for m in re.findall(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", s)]
+
+
+def note_paint(style: dict) -> tuple:
+    """A note's colours from the browser's computed style: (solid, gradient), gradient being
+    (start, end, angle in CSS degrees) or None. A note with a transparent background-color
+    (Whiteboard's newer note style) is expected to use its gradient's end colour when solid."""
+    grad = None
+    m = re.search(r"linear-gradient\(((?:[^()]|\([^()]*\))*)\)", style["image"])
+    if m:
+        cols = parse_rgbs(m.group(1)); ang = re.match(r"\s*([-\d.]+)deg", m.group(1))
+        if len(cols) >= 2:
+            grad = (cols[0], cols[-1], float(ang.group(1)) if ang else 180.0)
+    transparent = not parse_rgbs(style["color"]) or re.search(r"rgba\([^)]*,\s*0\)", style["color"])
+    solid = (grad[1] if grad else None) if transparent else parse_rgbs(style["color"])[0]
+    return solid, grad
+
+
+def expected_note_color(box, paint, solid_only, x, y):
+    solid, grad = paint
+    if solid_only or not grad:
+        return solid
+    a = math.radians(grad[2]); dx, dy = math.sin(a), -math.cos(a)
+    t = ((x - box[0] - box[2] / 2) * dx + (y - box[1] - box[3] / 2) * dy) / (abs(box[2] * dx) + abs(box[3] * dy)) + 0.5
+    t = min(1.0, max(0.0, t))
+    return tuple(s + (e - s) * t for s, e in zip(grad[0], grad[1]))
+
+
+def point_in_poly(x, y, poly) -> bool:
+    inside = False
+    for i in range(len(poly)):
+        (x1, y1), (x2, y2) = poly[i], poly[i - 1]
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            inside = not inside
+    return inside
+
+
+NOTE_SAMPLES = ((0.08, 0.08), (0.92, 0.08), (0.5, 0.5), (0.08, 0.92), (0.92, 0.92))
+
+
+def note_color_err(box, paint, solid_only, polys) -> float:
+    """Largest channel difference between the colour Whiteboard paints and the colour of the
+    topmost scene element, at five points inside the note."""
+    worst = 0.0
+    for fx, fy in NOTE_SAMPLES:
+        x, y = box[0] + fx * box[2], box[1] + fy * box[3]
+        exp = expected_note_color(box, paint, solid_only, x, y)
+        got = None
+        for pts, rgb in polys:
+            if point_in_poly(x, y, pts):
+                got = rgb
+        if exp is None:
+            continue
+        if got is None:
+            return 255.0
+        worst = max(worst, max(abs(e - g) for e, g in zip(exp, got)))
+    return round(worst, 1)
+
+
+def hex_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
 # ----------------------------------------------------------------------------------------
@@ -247,12 +352,18 @@ def outline(e, off):
     return [rotate_about(p, c, a) for p in pts]
 
 
+def is_band(e):
+    """A gradient note band: a grouped, borderless rectangle or closed line."""
+    return (e["type"] == "rectangle" or (e["type"] == "line" and e.get("polygon"))) \
+        and bool(e.get("groupIds")) and e.get("strokeColor") == "transparent"
+
+
 def is_shape(e):
     if e["type"] in ("ellipse", "diamond"):
         return True
     if e["type"] == "rectangle":   # notes are rounded (solid) or grouped bands (gradient)
         return not e.get("roundness") and not e.get("groupIds")
-    return e["type"] == "line" and bool(e.get("polygon"))
+    return e["type"] == "line" and bool(e.get("polygon")) and not is_band(e)
 
 
 def measure_scene(page, scene_path: Path, off) -> dict:
@@ -283,19 +394,26 @@ def measure_scene(page, scene_path: Path, off) -> dict:
     images = [e for e in els if e["type"] == "image"]
     svg_img = lambda e: files.get(e["fileId"], {}).get("mimeType") == "image/svg+xml"
 
-    # Notes: a rounded rectangle (solid) or the union of one group's bands (gradient).
-    notes, groups = [], {}
+    # Notes: a rounded rectangle (solid) or the union of one group's bands (gradient; each band
+    # but the last overlaps the next, inside the note). Each keeps its polygons and colours.
+    notes, note_polys, groups = [], [], {}
     for e in els:
-        if e["type"] == "rectangle" and e.get("groupIds"):
-            groups.setdefault(e["groupIds"][0], []).append(bx(e))
+        if is_band(e):
+            groups.setdefault(e["groupIds"][0], []).append((outline(e, off), hex_rgb(e["backgroundColor"])))
         elif e["type"] == "rectangle" and e.get("roundness"):
-            notes.append(bx(e))
+            notes.append(bx(e)); note_polys.append([(outline(e, off), hex_rgb(e["backgroundColor"]))])
     for g in groups.values():
-        x0 = min(b[0] for b in g); y0 = min(b[1] for b in g)
-        x1 = max(b[0] + b[2] for b in g); y1 = max(b[1] + b[3] - 0.15 for b in g)   # minus the band overlap
-        notes.append((x0, y0, x1 - x0, y1 - y0))
+        pts = [p for poly, _ in g for p in poly]
+        x0 = min(p[0] for p in pts); y0 = min(p[1] for p in pts)
+        notes.append((x0, y0, max(p[0] for p in pts) - x0, max(p[1] for p in pts) - y0)); note_polys.append(g)
 
-    linear = [e for e in els if e["type"] in ("line", "arrow") and not e.get("polygon")]
+    # Drawn underlines and ink strokes are lines too, marked with customData; they aren't
+    # connectors.
+    custom = lambda e, k: bool((e.get("customData") or {}).get(k))
+    linear = [e for e in els if e["type"] in ("line", "arrow") and not e.get("polygon")
+              and not custom(e, "underline") and not custom(e, "ink")]
+    inks = [{"pts": [(e["x"] + off[0] + p[0], e["y"] + off[1] + p[1]) for p in e["points"]], "w": e["strokeWidth"]}
+            for e in els if custom(e, "ink")]
     conns, arrows = [], []
     for e in linear:
         pts = [(e["x"] + off[0] + p[0], e["y"] + off[1] + p[1]) for p in e["points"]]
@@ -308,10 +426,64 @@ def measure_scene(page, scene_path: Path, off) -> dict:
         "stickers": [bx(e) for e in images if svg_img(e)],
         "images": [bx(e) for e in images if not svg_img(e)],
         "notes": notes,
+        "note_polys": note_polys,
         "shapes": [outline(e, off) for e in els if is_shape(e)],
         "connectors": conns,
         "arrows": arrows,
+        "inks": inks,
     }
+
+
+# ----------------------------------------------------------------------------------------
+# Excalidraw side: a picture of the scene for the report
+# ----------------------------------------------------------------------------------------
+# Excalidraw's own exporter (exportToSvg from @excalidraw/utils, installed into
+# tests/visual/node_modules by Setup-VisualTests.ps1) draws the scene, so the picture is what
+# Excalidraw shows. The bundle is an ES module, which a file:// page can't import, so the page
+# and bundle are served from a made-up origin through Playwright's request routing.
+EXCALIDRAW_BUNDLE = Path(__file__).resolve().parent / "node_modules" / "@excalidraw" / "utils" / "dist" / "prod"
+RENDER_ORIGIN = "http://excalidraw.test/"
+RENDER_PAGE = """<!doctype html><html><head><meta charset=utf-8>
+<style>html,body{margin:0;background:#fff}</style></head><body>
+<script type=module>
+import { exportToSvg } from './index.js';
+window.render = async (scene) => {
+  const svg = await exportToSvg({
+    data: { elements: scene.elements.filter(e => !e.isDeleted), files: scene.files || {},
+            appState: { ...(scene.appState || {}), exportBackground: true } },
+    config: { canvasBackgroundColor: '#ffffff', padding: 12 } });
+  document.body.innerHTML = ''; document.body.appendChild(svg);
+  const r = svg.getBoundingClientRect(); return [r.width, r.height];
+};
+window.ready = true;
+</script></body></html>"""
+
+
+def open_renderer(browser):
+    """A page that can draw .excalidraw scenes, or None when @excalidraw/utils isn't installed."""
+    if not (EXCALIDRAW_BUNDLE / "index.js").is_file():
+        return None
+    def serve(route):
+        rel = route.request.url[len(RENDER_ORIGIN):].split("?")[0].replace("%20", " ")
+        if rel in ("", "render.html"):
+            return route.fulfill(body=RENDER_PAGE, content_type="text/html")
+        f = EXCALIDRAW_BUNDLE / rel
+        if f.is_file():
+            return route.fulfill(path=str(f))
+        route.fulfill(status=404, body="")
+    page = browser.new_page()
+    page.route(RENDER_ORIGIN + "**", serve)
+    page.goto(RENDER_ORIGIN + "render.html")
+    page.wait_for_function("window.ready === true", timeout=60000)
+    return page
+
+
+def render_scene(page, scene_path: Path, shot: Path):
+    scene = json.loads(scene_path.read_text(encoding="utf-8"))
+    w, h = page.evaluate("s => window.render(s)", scene)
+    page.set_viewport_size({"width": max(200, math.ceil(w)), "height": max(200, math.ceil(h))})
+    page.wait_for_timeout(300)
+    page.screenshot(path=str(shot), full_page=True)
 
 
 # ----------------------------------------------------------------------------------------
@@ -343,7 +515,12 @@ def nearest_boxes(src, out):
     return errs
 
 
-def compare(src: dict, out: dict) -> dict:
+def path_dist(p, pts):
+    """Distance from p to an open polyline."""
+    return min(seg_dist(p, pts[i], pts[i + 1]) for i in range(len(pts) - 1)) if len(pts) > 1 else math.dist(p, pts[0])
+
+
+def compare(src: dict, out: dict, solid_only: bool) -> dict:
     res = {}
     # Texts: match by exact text, in order. Excalidraw drops bold and the font face, so line
     # widths differ; x is compared at the alignment anchor (left edge, centre or right edge),
@@ -369,9 +546,31 @@ def compare(src: dict, out: dict) -> dict:
                    "max": max(errs) if errs else None, "rows": rows,
                    "clipped": [{"text": t["text"][:50], "overflow": round(t["overflow"], 1)}
                                for t in out["texts"] if t["overflow"] > TEXT_CLIP_TOL]}
-    for k in ("sticker", "note", "image"):
+    for k in ("sticker", "image"):
         e = nearest_boxes(src[k + "s"], out[k + "s"])
         res[k] = {"expected": len(src[k + "s"]), "matched": len(out[k + "s"]), "max": round(max(e), 2) if e else None}
+    # Notes: nearest output note by centre; box error, and its colour at five points (solid
+    # fill, or the gradient at the gradient's angle).
+    ne, nc, pool = [], [], list(zip(out["notes"], out["note_polys"]))
+    for s, paint in zip(src["notes"], src["note_paints"]):
+        if not pool: break
+        c = (s[0] + s[2] / 2, s[1] + s[3] / 2)
+        j = min(range(len(pool)), key=lambda i: math.hypot(pool[i][0][0] + pool[i][0][2] / 2 - c[0], pool[i][0][1] + pool[i][0][3] / 2 - c[1]))
+        o, polys = pool.pop(j)
+        ne.append(box_err(s, o)); nc.append(note_color_err(s, paint, solid_only, polys))
+    res["note"] = {"expected": len(src["notes"]), "matched": len(out["notes"]), "max": round(max(ne), 2) if ne else None,
+                   "color": max(nc) if nc else None}
+    # Ink: pair each true stroke with the output stroke nearest its ends; largest distance
+    # either way between the two centrelines, and the width difference.
+    ie, iw, pool = [], [], list(out["inks"])
+    for s in src["inks"]:
+        if not pool: break
+        j = min(range(len(pool)), key=lambda i: math.dist(pool[i]["pts"][0], s["pts"][0]) + math.dist(pool[i]["pts"][-1], s["pts"][-1]))
+        o = pool.pop(j)
+        ie.append(max(max(path_dist(p, o["pts"]) for p in s["pts"]), max(path_dist(p, s["pts"]) for p in o["pts"])))
+        if s["w"] is not None: iw.append(abs(s["w"] - o["w"]))
+    res["ink"] = {"expected": len(src["inks"]), "matched": len(out["inks"]), "max": round(max(ie), 2) if ie else None,
+                  "width": round(max(iw), 3) if iw else None}
     # Shapes: nearest output outline; max distance both ways between true and output outline.
     sh = []; pool = list(out["shapes"])
     for s in src["shapes"]:
@@ -414,14 +613,62 @@ def compare(src: dict, out: dict) -> dict:
     if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
     if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
     if res["text"]["clipped"]: fails.append(f"{len(res['text']['clipped'])} text(s) wider than their element (clipped in Excalidraw)")
-    for k in ("sticker", "note", "image", "shape", "connector", "arrow"):
+    for k in ("sticker", "note", "image", "shape", "connector", "arrow", "ink"):
         if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
         if k == "shape":
             if res[k]["over"]: fails.append(f"{res[k]['over']} shape(s) off by up to {res[k]['max']} px")
         elif res[k]["max"] is not None and res[k]["max"] > TOL[k]: fails.append(f"{k} off by {res[k]['max']} px")
     if angle_bad: fails.append(f"{angle_bad} arrowhead(s) point the wrong way")
+    if res["note"]["color"] is not None and res["note"]["color"] > NOTE_COLOR_TOL:
+        fails.append(f"note colour off by {res['note']['color']}/255")
+    if res["ink"]["width"] is not None and res["ink"]["width"] > TOL["ink_width"]:
+        fails.append(f"ink width off by {res['ink']['width']} px")
     res["fails"] = fails
     return res
+
+
+# ----------------------------------------------------------------------------------------
+# Report
+# ----------------------------------------------------------------------------------------
+def write_report(out_root: Path, results: list[dict], rendered: bool):
+    def cell(r, k):
+        v = r["checks"].get(k) if r.get("checks") else None
+        if not v: return "<td>—</td>"
+        if k == "text":
+            return f"<td>{v['matched']}/{v['expected']} · median {v['median']} / max {v['max']}</td>"
+        if k == "ink" and not v["expected"] and not v["matched"]:
+            return "<td>—</td>"
+        extra = ""
+        if k == "note" and v.get("color") is not None: extra = f" · colour {v['color']}"
+        if k == "ink": extra = f" · width {v['width']}"
+        return f"<td>{v['matched']}/{v['expected']}" + (f" · max {v['max']}" if v['max'] is not None else "") + extra + "</td>"
+    cols = ("text", "sticker", "note", "image", "shape", "connector", "arrow", "ink")
+    rows = "".join(
+        f"<tr class='{'bad' if r['status'] != 'PASS' else ''}'><td><a href='#{r['board']}'>{r['board']}</a></td>"
+        f"<td>{r['version']}</td><td>{r['status']}</td>"
+        + "".join(cell(r, k) for k in cols)
+        + f"<td>{htmllib.escape('; '.join(r.get('fails', [])))}</td></tr>" for r in results)
+    figs = ""
+    for b in sorted({r["board"] for r in results}):
+        imgs = f"<figure><img src='shots/{b}_html.png'><figcaption>Whiteboard export</figcaption></figure>"
+        for v in VERSIONS:
+            if (out_root / "shots" / f"{b}_{v}.png").exists():
+                imgs += f"<figure><img src='shots/{b}_{v}.png'><figcaption>{v} → .excalidraw</figcaption></figure>"
+        figs += f"<h2 id='{b}'>{b}</h2><div class=grid>{imgs}</div>"
+    note = ("Renders are drawn by Excalidraw's own exporter (@excalidraw/utils exportToSvg)." if rendered else
+            "Excalidraw renders are missing: run tests\\Setup-VisualTests.ps1 to install @excalidraw/utils.")
+    doc = f"""<!doctype html><html><head><meta charset=utf-8><title>Visual checks</title><style>
+body{{font:14px/1.45 system-ui,sans-serif;margin:24px;color:#1d1b22;background:#fbfbfd}}
+table{{border-collapse:collapse;font-variant-numeric:tabular-nums}} td,th{{border:1px solid #ddd;padding:3px 8px}}
+th{{background:#f1eff6}} tr.bad td{{background:#fde8e8}} .grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
+figure{{margin:0;background:#f1eff6;padding:6px;border-radius:6px}} img{{width:100%;background:#fff}}
+figcaption{{font-size:12px;color:#666;text-align:center}}</style></head><body>
+<h1>Whiteboard → Excalidraw visual checks</h1>
+<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: {', '.join(f'{k} {v}' for k, v in TOL.items())}; note colour {NOTE_COLOR_TOL}/255.
+{note}</p>
+<table><tr><th>Board</th><th>Script</th><th>Status</th><th>Text</th><th>Stickers</th><th>Notes</th><th>Images</th><th>Shapes</th><th>Connectors</th><th>Arrowheads</th><th>Ink</th><th>Problems</th></tr>{rows}</table>
+{figs}</body></html>"""
+    (out_root / "report.html").write_text(doc, encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------------------
@@ -436,7 +683,7 @@ def main():
     a = ap.parse_args()
 
     ps = find_powershell(a.powershell)
-    a.out.mkdir(parents=True, exist_ok=True)
+    a.out.mkdir(parents=True, exist_ok=True); (a.out / "shots").mkdir(exist_ok=True)
     samples = sorted(d for d in a.samples.iterdir() if d.is_dir() and (not a.sample or d.name in a.sample))
     scripts = {v: instrument(a.scripts / f"Convert-WhiteboardHtmlToExcalidraw-{v}.ps1",
                              a.out / "_instrumented" / f"Convert-WhiteboardHtmlToExcalidraw-{v}.ps1") for v in a.version}
@@ -445,11 +692,15 @@ def main():
         browser = p.chromium.launch()
         hpage = browser.new_page(viewport={"width": 1600, "height": 1000}, device_scale_factor=2)
         tpage = browser.new_page()
+        rpage = open_renderer(browser)
+        if not rpage:
+            print("@excalidraw/utils is not installed (run tests\\Setup-VisualTests.ps1): "
+                  "the report will have no Excalidraw renders.", flush=True)
         for d in samples:
             html = next(d.glob("*.html"), None)
             if not html: continue
             try:
-                src = measure_html(hpage, html)
+                src = measure_html(hpage, html, a.out / "shots" / f"{d.name}_html.png")
             except Exception as e:
                 results.append({"board": d.name, "version": "-", "status": "ERROR", "fails": [f"HTML: {e}"]}); continue
             for v, script in scripts.items():
@@ -459,22 +710,30 @@ def main():
                     r.update(status="FAIL", fails=["conversion failed: " + log[-300:].replace("\n", " ")])
                 else:
                     try:
-                        r["checks"] = compare(src, measure_scene(tpage, scene, off))
+                        r["checks"] = compare(src, measure_scene(tpage, scene, off), solid_only=(v == "solid"))
                         r["fails"] = r["checks"].pop("fails")
                         r["status"] = "FAIL" if r["fails"] else "PASS"
                     except Exception as e:
                         r.update(status="ERROR", fails=[repr(e)])
+                    if rpage:
+                        # The picture is for people; a failed render doesn't fail the geometry check.
+                        try:
+                            render_scene(rpage, scene, a.out / "shots" / f"{d.name}_{v}.png")
+                        except Exception as e:
+                            print(f"{d.name} {v}: render failed: {e}", flush=True)
                 results.append(r)
                 c = r.get("checks", {})
                 m = lambda k: c.get(k, {}).get("max")
                 print(f"{d.name:24} {v:9} {r['status']:5}  text {m('text')}  sticker {m('sticker')}  note {m('note')}  "
                       f"image {m('image')}  shape {m('shape')}  connector {m('connector')}  arrow {m('arrow')}  "
+                      f"note colour {c.get('note', {}).get('color')}  ink {m('ink')}  "
                       f"{'; '.join(r.get('fails', []))}", flush=True)
         browser.close()
     (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+    write_report(a.out, results, rpage is not None)
     bad = [r for r in results if r["status"] != "PASS"]
     print(f"\n{len(results)} check(s): {len(results) - len(bad)} passed, {len(bad)} failed. "
-          f"Tolerances (board px): {TOL}. Details: {a.out / 'results.json'}")
+          f"Tolerances (board px): {TOL}. Report: {a.out / 'report.html'}")
     sys.exit(1 if bad else 0)
 
 
