@@ -4,3 +4,6 @@ tests/.venv/
 tests/visual/node_modules/
 __pycache__/
 *.pyc
+
+# Local screenshot of a sample board, not part of the export
+samples/CompareAndContrast2/CompareAndContrast2.png
