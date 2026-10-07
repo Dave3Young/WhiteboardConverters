@@ -695,6 +695,106 @@ begin {
         Add-TextElement $Elements ([string]$symbol) $X $Y $size $size ($size * 0.9) $color 'center'
     }
 
+    function Get-ConnectorPoints {
+        # The connector's line -- the first <path d> in its <g> -- as points in the anchor's
+        # local px. A straight connector is one M/L pair; an elbow connector adds corners
+        # (L/H/V) and a curved one Bezier segments (C/S/Q/T), which are flattened at about one
+        # point per 4 px. Only the first two number pairs used to be read, so a bent or curved
+        # connector came out as a straight line to its first corner. Exact is $false when the
+        # path holds something not traced here: an arc (A, drawn as a straight segment to its
+        # end point), a second subpath (joined on), or a malformed command (the rest is
+        # dropped). Returns $null for fewer than two points.
+        param([string]$Block)
+        $d = Get-FirstMatch $Block '<path\s+d="([^"]+)"'
+        if (-not $d) { return $null }
+        $tokens = @([regex]::Matches($d, '[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?') | ForEach-Object { $_.Value })
+        $argCount = @{ M = 2; L = 2; H = 1; V = 1; C = 6; S = 4; Q = 4; T = 2; A = 7; Z = 0 }
+        $pts = New-Object Collections.Generic.List[double[]]
+        $exact = $true; $i = 0; $cmd = ''; $prev = ''; $subpaths = 0
+        $cx = 0.0; $cy = 0.0; $sx = 0.0; $sy = 0.0; $qx = 0.0; $qy = 0.0   # current, subpath start, last control point
+        while ($i -lt $tokens.Count) {
+            if ($tokens[$i] -match '^[A-Za-z]$') { $cmd = $tokens[$i]; $i++ }
+            elseif (-not $cmd) { $exact = $false; break }
+            $up = $cmd.ToUpperInvariant()
+            if (-not $argCount.ContainsKey($up)) { $exact = $false; break }
+            $n = $argCount[$up]
+            $v = New-Object double[] $n
+            $ok = $true
+            for ($k = 0; $k -lt $n; $k++) {
+                if ($i + $k -ge $tokens.Count -or $tokens[$i + $k] -match '^[A-Za-z]$') { $ok = $false; break }
+                $v[$k] = Get-Number $tokens[$i + $k] 0
+            }
+            if (-not $ok) { $exact = $false; break }
+            $i += $n
+            $ox = if ($cmd -ceq $up) { 0.0 } else { $cx }; $oy = if ($cmd -ceq $up) { 0.0 } else { $cy }
+            $bx = $null; $by = $null   # Bezier control polygon, starting at the current point
+            switch ($up) {
+                'M' {
+                    $subpaths++
+                    if ($subpaths -gt 1) { $exact = $false }
+                    $cx = $ox + $v[0]; $cy = $oy + $v[1]; $sx = $cx; $sy = $cy
+                    [void]$pts.Add([double[]]@($cx, $cy))
+                    $cmd = if ($cmd -ceq 'M') { 'L' } else { 'l' }   # extra pairs after M are line-tos
+                }
+                'L' { $cx = $ox + $v[0]; $cy = $oy + $v[1]; [void]$pts.Add([double[]]@($cx, $cy)) }
+                'H' { $cx = $ox + $v[0]; [void]$pts.Add([double[]]@($cx, $cy)) }
+                'V' { $cy = $oy + $v[0]; [void]$pts.Add([double[]]@($cx, $cy)) }
+                'C' {
+                    $bx = @($cx, ($ox + $v[0]), ($ox + $v[2]), ($ox + $v[4]))
+                    $by = @($cy, ($oy + $v[1]), ($oy + $v[3]), ($oy + $v[5]))
+                }
+                'S' {
+                    $rx = $cx; $ry = $cy   # first control point: the previous one reflected
+                    if ($prev -eq 'C' -or $prev -eq 'S') { $rx = (2 * $cx) - $qx; $ry = (2 * $cy) - $qy }
+                    $bx = @($cx, $rx, ($ox + $v[0]), ($ox + $v[2]))
+                    $by = @($cy, $ry, ($oy + $v[1]), ($oy + $v[3]))
+                }
+                'Q' {
+                    $bx = @($cx, ($ox + $v[0]), ($ox + $v[2]))
+                    $by = @($cy, ($oy + $v[1]), ($oy + $v[3]))
+                }
+                'T' {
+                    $rx = $cx; $ry = $cy
+                    if ($prev -eq 'Q' -or $prev -eq 'T') { $rx = (2 * $cx) - $qx; $ry = (2 * $cy) - $qy }
+                    $bx = @($cx, $rx, ($ox + $v[0]))
+                    $by = @($cy, $ry, ($oy + $v[1]))
+                }
+                'A' { $exact = $false; $cx = $ox + $v[5]; $cy = $oy + $v[6]; [void]$pts.Add([double[]]@($cx, $cy)) }
+                'Z' { $cx = $sx; $cy = $sy; [void]$pts.Add([double[]]@($cx, $cy)); $cmd = '' }
+            }
+            if ($null -ne $bx) {
+                $deg = $bx.Count - 1
+                $qx = $bx[$deg - 1]; $qy = $by[$deg - 1]
+                $hull = 0.0
+                for ($k = 1; $k -le $deg; $k++) { $hull += [Math]::Sqrt([Math]::Pow($bx[$k] - $bx[$k - 1], 2) + [Math]::Pow($by[$k] - $by[$k - 1], 2)) }
+                $segments = [int][Math]::Min(64.0, [Math]::Max(4.0, [Math]::Ceiling($hull / 4.0)))
+                for ($k = 1; $k -le $segments; $k++) {
+                    $u = $k / $segments; $w = 1 - $u
+                    if ($deg -eq 2) {
+                        $px = ($w * $w * $bx[0]) + (2 * $w * $u * $bx[1]) + ($u * $u * $bx[2])
+                        $py = ($w * $w * $by[0]) + (2 * $w * $u * $by[1]) + ($u * $u * $by[2])
+                    } else {
+                        $px = ($w * $w * $w * $bx[0]) + (3 * $w * $w * $u * $bx[1]) + (3 * $w * $u * $u * $bx[2]) + ($u * $u * $u * $bx[3])
+                        $py = ($w * $w * $w * $by[0]) + (3 * $w * $w * $u * $by[1]) + (3 * $w * $u * $u * $by[2]) + ($u * $u * $u * $by[3])
+                    }
+                    [void]$pts.Add([double[]]@($px, $py))
+                }
+                $cx = $bx[$deg]; $cy = $by[$deg]
+            }
+            $prev = $up
+        }
+        $clean = New-Object Collections.Generic.List[double[]]   # drop zero-length steps
+        foreach ($p in $pts) {
+            if ($clean.Count -gt 0) {
+                $last = $clean[$clean.Count - 1]
+                if ([Math]::Abs($p[0] - $last[0]) -lt 0.001 -and [Math]::Abs($p[1] - $last[1]) -lt 0.001) { continue }
+            }
+            [void]$clean.Add($p)
+        }
+        if ($clean.Count -lt 2) { return $null }
+        return [pscustomobject]@{ Points = $clean.ToArray(); Exact = $exact }
+    }
+
     function Get-InkStrokes {
         # The strokes of an InkGroup (freehand ink), in board px. Whiteboard draws each stroke
         # as a filled outline <path> inside <g class="inkStroke" transform="matrix(...)"> (in
@@ -990,6 +1090,7 @@ begin {
         $shapeTracedCount = 0; $shapeFallbackCount = 0
         $rotatedCount = 0; $underlinedCount = 0; $mirrorIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
+        $connectorBentCount = 0; $connectorApprox = [Collections.Generic.List[string]]::new()
         $noteColors = Get-NoteColorTable $html
         $noteColorMissing = [Collections.Generic.List[string]]::new()
         $inkStrokeCount = 0; $inkApproximated = 0; $fontSubstituted = 0
@@ -1160,16 +1261,32 @@ begin {
                     $w = Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') 10
                     $h = Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') 10
                     $gTag = Get-FirstMatch $block '(<g\b[^>]*>)'
-                    $path = Get-FirstMatch $block '<path\s+d="([^"]+)"'
-                    $nums = @([regex]::Matches($path, '-?[0-9.]+') | ForEach-Object { Get-Number $_.Value })
-                    if ($nums.Count -ge 4) {
-                        $x1=$nums[0]; $y1=$nums[1]; $x2=$nums[2]; $y2=$nums[3]
-                    } else { $x1=0; $y1=0; $x2=$w; $y2=$h }
-                    # Endpoints go through the anchor's matrix, so scaled and rotated
-                    # connectors land where Whiteboard draws them. Excalidraw measures a linear
-                    # element's points from its first point, which sits at (x, y).
-                    $p1 = Get-BoardPoint $a $x1 $y1; $p2 = Get-BoardPoint $a $x2 $y2
-                    $dx = $p2[0] - $p1[0]; $dy = $p2[1] - $p1[1]
+                    $line = Get-ConnectorPoints $block
+                    if ($line) {
+                        $linePts = $line.Points
+                        if (-not $line.Exact) { [void]$connectorApprox.Add("$($a.Type):$($a.Key)") }
+                    } else {
+                        # No readable path: the diagonal of the connector's SVG box.
+                        $linePts = @([double[]]@(0.0, 0.0), [double[]]@($w, $h))
+                        [void]$connectorApprox.Add("$($a.Type):$($a.Key)")
+                    }
+                    $x1 = $linePts[0][0]; $y1 = $linePts[0][1]
+                    $x2 = $linePts[$linePts.Count - 1][0]; $y2 = $linePts[$linePts.Count - 1][1]
+                    # Points go through the anchor's matrix, so scaled and rotated connectors
+                    # land where Whiteboard draws them. Excalidraw measures a linear element's
+                    # points from its first point, which sits at (x, y); elbow and curved
+                    # connectors keep every bend (curves flattened) as extra points.
+                    $boardPts = @($linePts | ForEach-Object { ,(Get-BoardPoint $a $_[0] $_[1]) })
+                    $p1 = $boardPts[0]
+                    $minX = 0.0; $maxX = 0.0; $minY = 0.0; $maxY = 0.0
+                    $pointList = New-Object Collections.ArrayList
+                    foreach ($bp in $boardPts) {
+                        $dx = $bp[0] - $p1[0]; $dy = $bp[1] - $p1[1]
+                        [void]$pointList.Add([double[]]@($dx, $dy))
+                        $minX = [Math]::Min($minX, $dx); $maxX = [Math]::Max($maxX, $dx)
+                        $minY = [Math]::Min($minY, $dy); $maxY = [Math]::Max($maxY, $dy)
+                    }
+                    if ($boardPts.Count -gt 2) { $connectorBentCount++ }
                     $stroke = Convert-RgbaToHex (Get-FirstMatch $gTag '\bstroke="([^"]+)"') '#1f1f1f'
                     $style = if ($gTag -match 'stroke-dasharray') { 'dashed' } else { 'solid' }
                     # Arrowheads: Whiteboard draws each as its own open chevron path inside the
@@ -1188,9 +1305,7 @@ begin {
                     }
                     # Excalidraw only draws arrowheads on "arrow" elements, not on "line".
                     $lineType = if ($startHead -or $endHead) { 'arrow' } else { 'line' }
-                    $e = New-BaseElement $lineType $p1[0] $p1[1] ([Math]::Abs($dx)) ([Math]::Abs($dy)) $stroke 'transparent' $style 2
-                    $pointList = New-Object Collections.ArrayList
-                    [void]$pointList.Add([double[]]@(0,0)); [void]$pointList.Add([double[]]@($dx,$dy))
+                    $e = New-BaseElement $lineType $p1[0] $p1[1] ($maxX - $minX) ($maxY - $minY) $stroke 'transparent' $style 2
                     $e.points = $pointList; $e.lastCommittedPoint = $null
                     $e.startBinding=$null; $e.endBinding=$null; $e.startArrowhead=$startHead; $e.endArrowhead=$endHead
                     if ($lineType -eq 'arrow') { $e.elbowed = $false }
@@ -1316,6 +1431,8 @@ begin {
             StickersEmbedded=$stickerImageCount; StickersFallback=$stickerFallbackCount
             ShapesTraced=$shapeTracedCount; ShapesFromLabel=$shapeFallbackCount
             RotatedObjects=$rotatedCount; ArrowheadsConverted=$arrowheadCount
+            ConnectorsBent=$connectorBentCount
+            ConnectorsApproximated=$connectorApprox.Count; ConnectorsApproximatedDetails=@($connectorApprox)
             UnderlinedTexts=$underlinedCount
             MirrorIgnored=$mirrorIgnored.Count; MirrorIgnoredDetails=@($mirrorIgnored)
             NoteColorMissing=$noteColorMissing.Count; NoteColorMissingDetails=@($noteColorMissing)
@@ -1355,6 +1472,13 @@ process {
         }
         if ($result.ShapesFromLabel -gt 0) {
             Write-Warning ("{0} shape(s) had an outline that couldn't be traced and were built from their label." -f $result.ShapesFromLabel)
+        }
+        if ($result.ConnectorsBent -gt 0) {
+            Write-Host ("  {0} elbow/curved connector(s) traced through every bend." -f $result.ConnectorsBent)
+        }
+        if ($result.ConnectorsApproximated -gt 0) {
+            Write-Warning ("{0} connector(s) had a line this script could not fully trace (an arc, a second subpath or no path); those parts were drawn straight: {1}" -f `
+                $result.ConnectorsApproximated, ($result.ConnectorsApproximatedDetails -join ', '))
         }
         if ($result.InkStrokes -gt 0) {
             Write-Host ("  {0} ink stroke(s) converted." -f $result.InkStrokes)

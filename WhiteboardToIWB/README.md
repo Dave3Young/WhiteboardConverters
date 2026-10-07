@@ -45,7 +45,7 @@ only if you're targeting another application.
 | Plain text | A text area, keeping line breaks, bold, alignment, rotation and the export's font (Arial or Segoe UI). |
 | Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text, in Segoe UI. |
 | Shape | A rectangle, or a polygon traced from Whiteboard's exact outline, so ovals stay round and rotated shapes stay rotated. Unfilled outlines that aren't rectangles are written as their edges. |
-| Connector | A line grouped with its arrowheads. Dashes are kept. |
+| Connector | A line grouped with its arrowheads, following every bend of an elbow or curved connector. Dashes are kept. |
 | Freehand ink | Each stroke as lines at the pen's width, grouped together. |
 | Reaction sticker | Whiteboard's original artwork, converted to PNG. |
 | Image | PNG, JPEG, GIF or BMP. WebP images are converted to PNG, and very large images are downscaled. |
@@ -66,6 +66,8 @@ The run summary reports these when they occur.
 - **Underline:** text keeps `text-decoration="underline"`, but OpenBoard's importer ignores it,
   so a single unrotated line also gets a drawn underline grouped with it. Wrapped or rotated
   underlined text has no drawn line, and the run summary says so.
+- **Elbow and curved connectors** are traced through every bend, but no sample has one, so
+  they are tested only on hand-edited paths. Arcs are drawn straight.
 - **Untested imports:** the files haven't yet been tried in OpenBoard itself, or in other IWB
   readers such as SMART Notebook or ActivInspire. The conversions are checked against
   OpenBoard's importer source code and the test suites below.

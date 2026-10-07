@@ -44,7 +44,7 @@ Open the file at [excalidraw.com](https://excalidraw.com/) or in the Excalidraw 
 | Plain text | Editable text, wrapped into the same lines as in Whiteboard and re-wrapped by Excalidraw when you edit it. |
 | Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text. |
 | Shape | Rectangles, ovals and diamonds become native Excalidraw shapes, sized to Whiteboard's exact outline. Any other shape becomes a closed line. Text inside a shape becomes a separate text element. |
-| Connector | A native Excalidraw arrow or line, keeping its arrowheads and dashes. |
+| Connector | A native Excalidraw arrow or line, keeping its arrowheads and dashes. Elbow and curved connectors keep every bend as a point. |
 | Freehand ink | Each stroke as a line at the pen's width, grouped together. |
 | Reaction sticker | Whiteboard's original vector artwork. |
 | Image | The embedded image. Very large images are downscaled. |
@@ -60,6 +60,8 @@ The run summary reports every item below when it occurs.
   in Whiteboard (newer exports use Segoe UI) is narrower, and is counted.
 - **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
   effect pen is approximated.
+- **Elbow and curved connectors** are traced through every bend (curves as many short steps),
+  but no sample has one, so they are tested only on hand-edited paths. Arcs are drawn straight.
 - **Underline:** Excalidraw text can't be underlined, so a line is drawn under each line of
   underlined text and grouped with it. If you edit the text, the line doesn't follow the new
   wording.

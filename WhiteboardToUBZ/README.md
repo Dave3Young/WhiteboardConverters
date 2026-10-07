@@ -41,7 +41,7 @@ Open the `.ubz` in [OpenBoard](https://openboard.ch/).
 | Plain text | Editable text, keeping line breaks, bold, alignment, rotation and the export's font (Arial or Segoe UI). |
 | Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text. |
 | Shape | A fill and border traced from Whiteboard's exact outline and grouped together. Ovals stay round, and rotated shapes stay rotated. |
-| Connector | A line grouped with its arrowheads. |
+| Connector | A line grouped with its arrowheads, following every bend of an elbow or curved connector. |
 | Freehand ink | Each stroke as a line at the pen's width, grouped together. |
 | Reaction sticker | Whiteboard's original vector artwork (SVG). |
 | Image | The embedded image. Very large images are downscaled. |
@@ -55,7 +55,7 @@ The run summary reports every item below when it occurs.
 - **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
   effect pen is approximated.
 - **Unverified cases:** there are no samples of text inside shapes, or of elbow or curved
-  connectors.
+  connectors (these are traced through every bend, but only tested on hand-edited paths).
 
 ## Tests
 ```powershell
