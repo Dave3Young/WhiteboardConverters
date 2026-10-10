@@ -50,7 +50,7 @@ SCRIPT = "Convert-WhiteboardHtmlToIwb.ps1"
 
 # Pass/fail tolerances in board pixels.
 # image_content: mean colour difference (0-255) between the two images' 8 x 8 thumbnails.
-TOL = {"text": 5.0, "image": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5, "image_content": 3.0,
+TOL = {"text": 5.0, "image": 0.5, "note": 0.5, "shape": 1.5, "connector": 0.5, "arrow": 0.5, "image_content": 3.0,
        "note_color": 3.0, "ink": 0.5, "ink_width": 0.1}
 # note_color: largest channel difference (0-255) at five points of each note; ink_width in board px.
 
@@ -155,7 +155,7 @@ BASELINE = r"""(el, rect) => {
 
 # ----------------------------------------------------------------------------------------
 JS_HTML = (r"""async () => {
-  const cal = [], texts = [], images = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [];
+  const cal = [], texts = [], images = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [], connectors = [];
   const thumb = THUMB;
   const baseline = BASELINE;
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
@@ -165,16 +165,36 @@ JS_HTML = (r"""async () => {
     if (L && T && !/transform/.test(st)) cal.push([+L[1], +T[1], r.left + scrollX, r.top + scrollY]);
     const type = a.dataset.whiteboardType;
     const spans = [...a.querySelectorAll('span[data-text="true"]')];
-    const t = spans.map(s => s.textContent).join('');
+    // Each Draft.js block (<div data-block>) is a paragraph: one line break between blocks.
+    const blocks = [...a.querySelectorAll('div[data-block="true"]')];
+    const t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
+                            : spans.map(s => s.textContent).join('');
     if (t.trim()) {
-      const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
+      // The first paragraph only: a Range across several Draft.js blocks also spans the blocks'
+      // own boxes, so it is the column's full width (the output side stops at the first break).
+      const para = blocks.length ? [...blocks[0].querySelectorAll('span[data-text="true"]')] : [];
+      const rg = document.createRange(), last = para.length ? para[para.length - 1] : spans[spans.length - 1], lf = last.firstChild || last;
       rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
       const b = rg.getBoundingClientRect(), [x, y] = baseline(spans[0], b);
       texts.push({type, text: t.replace(/\r\n?/g, '\n'), x: x + scrollX, y: y + scrollY, w: b.width, h: b.height});
     }
-    if (type === 'ReactionStickers' || type === 'Image' || type === 'AzureImage') {
+    // An image's top-left, top-right and bottom-left corners, read from zero-size markers
+    // laid on its corners, so rotation and scale come from the browser's own transform.
+    if (['ReactionStickers', 'Image', 'AzureImage', 'FluidImage'].includes(type)) {
       const im = a.querySelector('img');
-      if (im) { const i = im.getBoundingClientRect(); images.push([i.left + scrollX, i.top + scrollY, i.width, i.height, await thumb(im.src)]); }
+      if (im) {
+        // The used size, unrounded (offsetWidth/offsetHeight are whole px: 578 for 577.535,
+        // 2 px at SailboatRetrospective's 4.38x scale).
+        const host = im.parentElement; host.style.position = 'relative';
+        const W = parseFloat(getComputedStyle(im).width), H = parseFloat(getComputedStyle(im).height);
+        const corners = [[0, 0], [1, 0], [0, 1]].map(([u, v]) => {
+          const k = document.createElement('div');
+          k.style.cssText = 'position:absolute;width:0;height:0;left:' + (im.offsetLeft + u * W) + 'px;top:' + (im.offsetTop + v * H) + 'px';
+          host.append(k); const q = k.getBoundingClientRect(); k.remove();
+          return [q.left + scrollX, q.top + scrollY];
+        });
+        images.push([corners, await thumb(im.src)]);
+      }
     }
     if (type === 'Note') {
       const bg = a.querySelector('.textBoxBackground'), b = bg.getBoundingClientRect(), cs = getComputedStyle(bg);
@@ -203,6 +223,17 @@ JS_HTML = (r"""async () => {
       const m = p.getScreenCTM(), n = p.getTotalLength();
       arrows.push([0, n / 2, n].map(l => { const q = p.getPointAtLength(l); return pt(m, q.x, q.y); }));
     });
+    // The connector's line, sampled every 0.5 px so samples cut an elbow's corners by no more
+    // than 0.35 px (a zero-length line draws nothing).
+    if (type === 'Connector') {
+      const p = a.querySelector('svg g > path:not([transform])');
+      const len = p ? p.getTotalLength() : 0;
+      if (len > 0) {
+        const n = Math.max(2, Math.ceil(len / 0.5)), m = p.getScreenCTM(), pts = [];
+        for (let i = 0; i <= n; i++) { const q = p.getPointAtLength(len * i / n); pts.push(pt(m, q.x, q.y)); }
+        connectors.push(pts);
+      }
+    }
   }
   // The anchor divs themselves are 0 x 0 (their content overflows them), so take the union
   // of everything drawn inside them; comment threads are not board objects.
@@ -210,7 +241,7 @@ JS_HTML = (r"""async () => {
               .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
-  return {cal, texts, images, shapes, arrows, notes, noteStyles, inks, bbox};
+  return {cal, texts, images, shapes, arrows, notes, noteStyles, inks, connectors, bbox};
 }""").replace("THUMB", THUMB, 1).replace("BASELINE", BASELINE, 1)
 
 
@@ -235,8 +266,9 @@ def measure_html(page, html: Path, shot: Path) -> dict:
                         clip={"x": max(0, x0 - pad), "y": max(0, y0 - pad), "width": x1 - x0 + 2 * pad, "height": y1 - y0 + 2 * pad})
     return {
         "texts": [dict(t, bx=to_b(t["x"], t["y"])[0], by=to_b(t["x"], t["y"])[1]) for t in d["texts"]],
-        "images": [(*to_b(s[0], s[1]), s[2] / kx, s[3] / ky) for s in d["images"]],
-        "thumbs": [s[4] for s in d["images"]],
+        "images": [[to_b(*q) for q in s[0]] for s in d["images"]],
+        "thumbs": [s[1] for s in d["images"]],
+        "connectors": [[to_b(*q) for q in c] for c in d["connectors"]],
         "notes": [(*to_b(s[0], s[1]), s[2] / kx, s[3] / ky) for s in d["notes"]],
         "shapes": [{"label": s["label"], "pts": [to_b(*q) for q in s["pts"]]} for s in d["shapes"]],
         "arrows": [[to_b(*q) for q in a] for a in d["arrows"]],
@@ -342,8 +374,23 @@ def textarea_lines(el) -> list[str]:
     for c in el:
         if local(c.tag) == "tbreak":
             lines.append("")
+        elif local(c.tag) == "tspan":
+            lines[-1] += c.text or ""
         lines[-1] += c.tail or ""
     return lines
+
+
+def textarea_html(el) -> str:
+    """A textarea's content as HTML: <br/> for tbreak, a styled <span> for each tspan."""
+    out = [htmllib.escape(el.text or "")]
+    for c in el:
+        if local(c.tag) == "tbreak":
+            out.append("<br/>")
+        elif local(c.tag) == "tspan":
+            css = "".join(f"{k}:{CSS_WEIGHT.get(c.get(k), c.get(k))};" for k in ("font-weight", "font-style", "text-decoration") if c.get(k))
+            out.append(f'<span style="{css}">{htmllib.escape(c.text or "")}</span>')
+        out.append(htmllib.escape(c.tail or ""))
+    return "".join(out)
 
 
 # OpenBoard's weight names as CSS weights (demibold isn't a CSS keyword).
@@ -376,22 +423,38 @@ def browser_svg(z: zipfile.ZipFile, page, size, scale: float) -> str:
             align = {"center": "center", "end": "right"}.get(el.get("text-align"), "left")
             fs = re.fullmatch(r"([\d.]+)(\D*)", el.get("font-size"))
             style = (f"font-family:'{el.get('font-family')}';font-size:{float(fs[1]) / scale:g}{fs[2]};font-weight:{CSS_WEIGHT.get(el.get('font-weight'), el.get('font-weight'))};"
+                     f"font-style:{el.get('font-style', 'normal')};"
                      f"color:{el.get('fill')};text-align:{align};white-space:pre-wrap;overflow-wrap:break-word;"
                      "line-height:normal;margin:0;width:100%;overflow:visible")
-            body = "<br/>".join(htmllib.escape(line) for line in textarea_lines(el))
-            fo = attrs(el, skip=("font-family", "font-size", "font-weight", "fill", "text-align",
-                                 "x", "y", "width", "height", "transform"))
+            body = textarea_html(el)
+            # line-increment spaces the baselines and (like a renderer laying out SVG Tiny 1.2
+            # text) leaves the first line where it is; JS_LINE_INCREMENT applies it.
+            inc = f' data-inc="{float(el.get("line-increment")) / scale:g}"' if el.get("line-increment") else ""
+            fo = attrs(el, skip=("font-family", "font-size", "font-weight", "font-style", "fill", "text-align",
+                                 "x", "y", "width", "height", "transform", "line-increment"))
             g = f"{el.get('transform', '')} translate({el.get('x', '0')},{el.get('y', '0')}) scale({scale!r})".strip()
             out.append(f'<g transform="{g}"><foreignObject {fo} width="{float(el.get("width")) / scale:g}" '
                        f'height="{float(el.get("height")) / scale:g}" overflow="visible"><div xmlns="http://www.w3.org/1999/xhtml" '
-                       f'class="ta" style="{style}">{body}</div></foreignObject></g>')
+                       f'class="ta"{inc} style="{style}">{body}</div></foreignObject></g>')
     out.append("</svg>")
     return "".join(out)
 
 
+# A textarea's line-increment as the line height, with a negative top margin that cancels the
+# half-leading CSS would add above the first line.
+JS_LINE_INCREMENT = r"""() => document.querySelectorAll('div.ta[data-inc]').forEach(div => {
+  const d = document.createElement('div'); d.textContent = 'x'; div.prepend(d);
+  const normal = d.offsetHeight; d.remove();
+  const L = parseFloat(div.dataset.inc);
+  div.style.lineHeight = L + 'px'; div.style.marginTop = (-(L - normal) / 2) + 'px';
+})"""
+
+
 JS_SVG = r"""() => [...document.querySelectorAll('div.ta')].map(div => {
   if (!div.firstChild) return null;
-  const rg = document.createRange(); rg.selectNodeContents(div);
+  // The text up to the first <br>: the first paragraph, as on the HTML side.
+  const br = [...div.childNodes].findIndex(n => n.nodeName.toLowerCase() === 'br');
+  const rg = document.createRange(); rg.setStart(div, 0); rg.setEnd(div, br < 0 ? div.childNodes.length : br);
   const r = rg.getBoundingClientRect(), svg = document.querySelector('svg'), m = svg.getScreenCTM().inverse();
   const P = (x, y) => { const q = svg.createSVGPoint(); q.x = x; q.y = y; return q.matrixTransform(m); };
   const a = P(...(BASELINE)(div, r));
@@ -413,6 +476,7 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
     page_.set_viewport_size({"width": int(size[0]), "height": int(size[1])})
     page_.set_content("<html><body style='margin:0;background:#fff'>" + browser_svg(z, page, size, s) + "</body></html>")
     page_.wait_for_timeout(500)
+    page_.evaluate(JS_LINE_INCREMENT)
     page_.screenshot(path=str(shot), full_page=True)
     texts = [dict(t, bx=B(t["x"], t["y"])[0], by=B(t["x"], t["y"])[1]) for t in page_.evaluate(JS_SVG)]
 
@@ -420,8 +484,12 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
     for el in page:
         tag = local(el.tag); gid = groups.get(el.get("id"))
         if tag == "image":
-            x, y = B(float(el.get("x")), float(el.get("y")))
-            images.append((x, y, float(el.get("width")) / s, float(el.get("height")) / s))
+            # Top-left, top-right and bottom-left corners, through translate(x,y) rotate(a).
+            tr = re.match(r"\s*translate\(([-\d.]+)[ ,]+([-\d.]+)\)\s*rotate\(([-\d.]+)\)", el.get("transform", ""))
+            x0, y0, ang = (float(tr[1]), float(tr[2]), math.radians(float(tr[3]))) if tr else (0.0, 0.0, 0.0)
+            x0 += float(el.get("x")); y0 += float(el.get("y"))
+            w, h, c, sn = float(el.get("width")), float(el.get("height")), math.cos(ang), math.sin(ang)
+            images.append([B(x0, y0), B(x0 + c * w, y0 + sn * w), B(x0 - sn * h, y0 + c * h)])
         elif tag == "rect":
             x, y = B(float(el.get("x")), float(el.get("y")))
             box = (x, y, float(el.get("width")) / s, float(el.get("height")) / s)
@@ -450,7 +518,7 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
     # Shapes: rect corners, polygons, and closed loops of edges (unfilled non-rectangles).
     shapes = [[(b[0], b[1]), (b[0] + b[2], b[1]), (b[0] + b[2], b[1] + b[3]), (b[0], b[1] + b[3])]
               for b in (r["box"] for r in rects)] + polys
-    arrows, inks = [], []
+    arrows, inks, connectors = [], [], []
     close = lambda p, q: math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-6 / s + 0.01
     for group_lines in by_group.values():
         lines = [l for l, _ in group_lines]
@@ -461,6 +529,15 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
             continue
         if len(lines) >= 3 and close(lines[-1][1], lines[0][0]) and all(close(lines[i][1], lines[i + 1][0]) for i in range(len(lines) - 1)):
             shapes.append([l[0] for l in lines])
+        else:
+            # A connector: its edges come first and chain end to end; its arrowheads follow
+            # (each starts at an arm, not where the line ends). Underlines and fallback stickers
+            # land here too, which is why connectors are matched to the nearest output line.
+            chain = [lines[0][0], lines[0][1]]
+            for l in lines[1:]:
+                if not close(chain[-1], l[0]): break
+                chain.append(l[1])
+            connectors.append(chain)
         # Arrowheads: two consecutive edges that meet at the tip.
         for a, b in zip(lines, lines[1:]):
             if close(a[1], b[0]):
@@ -468,7 +545,7 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
     thumbs = page_.evaluate("async (srcs) => { const thumb = " + THUMB + "; const r = []; for (const s of srcs) r.push(await thumb(s)); return r; }",
                             [img_src(z, el) for el in page if local(el.tag) == "image"])
     return {"texts": texts, "images": images, "notes": notes, "note_polys": note_polys, "shapes": shapes,
-            "arrows": arrows, "inks": inks, "thumbs": thumbs}
+            "arrows": arrows, "inks": inks, "thumbs": thumbs, "connectors": connectors}
 
 
 # ----------------------------------------------------------------------------------------
@@ -509,8 +586,9 @@ def compare(src: dict, out: dict, solid_only: bool) -> dict:
     res["text"] = {"expected": len(src["texts"]), "matched": len(errs),
                    "median": round(sorted(errs)[len(errs) // 2], 1) if errs else None,
                    "max": max(errs) if errs else None, "rows": rows}
-    # Images (stickers and pictures): same order in both.
-    ie = [max(abs(a - b) for a, b in zip(s, o)) for s, o in zip(src["images"], out["images"])]
+    # Images (stickers and pictures): same order in both; largest corner distance (catches
+    # rotation and scale).
+    ie = [max(math.dist(a, b) for a, b in zip(s, o)) for s, o in zip(src["images"], out["images"])]
     # Content: mean colour difference (0-255) of 8 x 8 thumbnails drawn on white.
     td = [sum(abs(a - b) for a, b in zip(s, o)) / len(s) for s, o in zip(src["thumbs"], out["thumbs"]) if s and o]
     res["image"] = {"expected": len(src["images"]), "matched": len(out["images"]), "max": round(max(ie), 2) if ie else None,
@@ -557,10 +635,20 @@ def compare(src: dict, out: dict, solid_only: bool) -> dict:
         best = min((max(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(s, o)) for o in out["arrows"]), default=None)
         if best is not None: ae.append(best)
     res["arrow"] = {"expected": len(src["arrows"]), "matched": len(ae), "max": round(max(ae), 2) if ae else None}
+    # Connector lines: each true line against the output line nearest its ends; largest distance
+    # either way between the two.
+    ce, pool = [], list(out["connectors"])
+    for s in src["connectors"]:
+        if not pool: break
+        j = min(range(len(pool)), key=lambda i: min(math.dist(pool[i][0], s[0]) + math.dist(pool[i][-1], s[-1]),
+                                                   math.dist(pool[i][0], s[-1]) + math.dist(pool[i][-1], s[0])))
+        o = pool.pop(j)
+        ce.append(max(max(path_dist(p, o) for p in s), max(path_dist(p, s) for p in o)))
+    res["connector"] = {"expected": len(src["connectors"]), "matched": len(ce), "max": round(max(ce), 2) if ce else None}
     fails = []
     if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
     if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
-    for k in ("image", "note", "shape", "arrow", "ink"):
+    for k in ("image", "note", "shape", "connector", "arrow", "ink"):
         if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
         if res[k]["max"] is not None and res[k]["max"] > TOL[k]: fails.append(f"{k} off by {res[k]['max']} px")
     if res["note_color"]["max"] is not None and res["note_color"]["max"] > TOL["note_color"]:
@@ -584,7 +672,7 @@ def write_report(out_root: Path, results: list[dict]):
             return f"<td>{v['matched']}/{v['expected']} · median {v['median']} / max {v['max']}</td>"
         if k == "note_color":
             return f"<td>{v['max'] if v['max'] is not None else '—'}</td>"
-        if k == "ink" and not v["expected"] and not v["matched"]:
+        if k in ("ink", "connector") and not v["expected"] and not v["matched"]:
             return "<td>—</td>"
         if k == "ink":
             return f"<td>{v['matched']}/{v['expected']} · max {v['max']} · width {v['width']}</td>"
@@ -592,7 +680,7 @@ def write_report(out_root: Path, results: list[dict]):
         return f"<td>{v['matched']}/{v['expected']}" + (f" · max {v['max']}" if v['max'] is not None else "") + extra + "</td>"
     rows = "".join(
         f"<tr class='{'bad' if r['status'] != 'PASS' else ''}'><td>{r['board']}</td><td>{r['fill']}</td><td>{r['status']}</td>"
-        + "".join(cell(r, k) for k in ("text", "image", "note", "note_color", "shape", "arrow", "ink"))
+        + "".join(cell(r, k) for k in ("text", "image", "note", "note_color", "shape", "connector", "arrow", "ink"))
         + f"<td>{'; '.join(r.get('fails', []))}</td></tr>" for r in results)
     boards = sorted({r["board"] for r in results})
     figs = ""
@@ -609,9 +697,9 @@ th{{background:#f1eff6}} tr.bad td{{background:#fde8e8}} .grid{{display:grid;gri
 figure{{margin:0;background:#f1eff6;padding:6px;border-radius:6px}} img{{width:100%;background:#fff}}
 figcaption{{font-size:12px;color:#666;text-align:center}}</style></head><body>
 <h1>Whiteboard → IWB visual checks</h1>
-<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, image {TOL['image']}, note {TOL['note']}, shape {TOL['shape']}, arrowhead {TOL['arrow']}, ink {TOL['ink']} (width {TOL['ink_width']}); note colour {TOL['note_color']}/255.
+<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, image {TOL['image']}, note {TOL['note']}, shape {TOL['shape']}, connector {TOL['connector']}, arrowhead {TOL['arrow']}, ink {TOL['ink']} (width {TOL['ink_width']}); note colour {TOL['note_color']}/255.
 Renders show the IWB page as a standard SVG renderer draws it (textarea as a wrapped text box).</p>
-<table><tr><th>Board</th><th>Notes</th><th>Status</th><th>Text</th><th>Images</th><th>Notes</th><th>Note colour</th><th>Shapes</th><th>Arrowheads</th><th>Ink</th><th>Problems</th></tr>{rows}</table>
+<table><tr><th>Board</th><th>Notes</th><th>Status</th><th>Text</th><th>Images</th><th>Notes</th><th>Note colour</th><th>Shapes</th><th>Connectors</th><th>Arrowheads</th><th>Ink</th><th>Problems</th></tr>{rows}</table>
 {figs}</body></html>"""
     (out_root / "report.html").write_text(doc, encoding="utf-8")
 
@@ -659,7 +747,7 @@ def main():
                 c = r.get("checks", {})
                 print(f"{d.name:26} {f:8} {r['status']:5}  text max {c.get('text', {}).get('max')}  "
                       f"image {c.get('image', {}).get('max')}  note {c.get('note', {}).get('max')}  shape {c.get('shape', {}).get('max')}  "
-                      f"arrow {c.get('arrow', {}).get('max')}  note colour {c.get('note_color', {}).get('max')}  "
+                      f"connector {c.get('connector', {}).get('max')}  arrow {c.get('arrow', {}).get('max')}  note colour {c.get('note_color', {}).get('max')}  "
                       f"ink {c.get('ink', {}).get('max')}  {'; '.join(r.get('fails', []))}", flush=True)
         browser.close()
     (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")

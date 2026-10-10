@@ -82,9 +82,14 @@ function Get-SourceExpectations {
         }
         switch ($type) {
             'PlainText' {
-                $spans = [regex]::Matches($block, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
-                # As a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF.
-                $t = (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '') -replace "`r`n?", "`n"
+                # As a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF,
+                # and each Draft.js block (<div data-block="true">) is a paragraph of its own.
+                $paras = @([regex]::Matches($block, '<div\b[^>]*\bdata-block="true"[^>]*>(.*?)(?=<div\b[^>]*\bdata-block="true"|$)', $RxOpts) | ForEach-Object { $_.Groups[1].Value })
+                if ($paras.Count -eq 0) { $paras = @($block) }
+                $t = (@($paras | ForEach-Object {
+                    $spans = [regex]::Matches($_, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
+                    (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '')
+                }) -join "`n") -replace "`r`n?", "`n"
                 if ($t.Trim()) { $texts.Add($t) }
             }
             'Shape' {

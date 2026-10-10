@@ -38,24 +38,23 @@ Open the `.ubz` in [OpenBoard](https://openboard.ch/).
 ## What gets converted
 | Whiteboard object | In OpenBoard |
 | --- | --- |
-| Plain text | Editable text, keeping line breaks, bold, alignment, rotation and the export's font (Arial or Segoe UI). |
+| Plain text | Editable text, keeping paragraphs, line breaks, alignment, rotation, line spacing, the export's font (Arial, Segoe UI, Aptos, ...) and bold, italic and underline, including on parts of a text. |
 | Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text. |
 | Shape | A fill and border traced from Whiteboard's exact outline and grouped together. Ovals stay round, and rotated shapes stay rotated. |
 | Connector | A line grouped with its arrowheads, following every bend of an elbow or curved connector. |
 | Freehand ink | Each stroke as a line at the pen's width, grouped together. |
-| Reaction sticker | Whiteboard's original vector artwork (SVG). |
-| Image | The embedded image. Very large images are downscaled. |
+| Reaction sticker | Whiteboard's original vector artwork (SVG), keeping its rotation. |
+| Image | The embedded image, keeping its rotation. Very large images are downscaled. |
 
 ## Limits
 The run summary reports every item below when it occurs.
 - **Dashed lines** are drawn solid, because OpenBoard has no dashed ink style.
-- **Rotated notes, images and stickers** are drawn unrotated at the right size. None of the
-  samples has any.
+- **Rotated notes** are drawn unrotated at the right size. None of the samples has any.
 - **Formatting:** note text is drawn in Arial, not Whiteboard's Aptos. Underline is kept.
 - **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
   effect pen is approximated.
-- **Unverified cases:** there are no samples of text inside shapes, or of elbow or curved
-  connectors (these are traced through every bend, but only tested on hand-edited paths).
+- **Curved connectors** are traced through every bend, but no sample has one, so they are
+  tested only on hand-edited paths. Elbow connectors are tested (RotatedTest1).
 
 ## Tests
 ```powershell
@@ -64,8 +63,8 @@ The run summary reports every item below when it occurs.
 .\tests\Invoke-VisualTests.ps1    # geometry vs. Whiteboard's real layout
 ```
 
-- **Samples:** `samples\` holds 60 real Whiteboard exports.
+- **Samples:** `samples\` holds 61 real Whiteboard exports.
 - **Visual tests:** they measure the original board in headless Chromium and compare every
-  text, note, shape, sticker, arrowhead and ink stroke position, and every note's colour, with
+  text, note, shape, sticker, image, connector, arrowhead and ink stroke position, and every note's colour, with
   the converted file. The report is
   written to `tests\out\visual\report.html`.

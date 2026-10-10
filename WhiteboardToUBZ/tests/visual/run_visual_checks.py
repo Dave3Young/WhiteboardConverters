@@ -47,7 +47,7 @@ VERSIONS = ("v2_solid", "v3_gradient")
 
 # Pass/fail tolerances in board pixels; note_color is the largest channel difference (0-255)
 # at five points of each note, ink_width the stroke width difference in board px.
-TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5,
+TOL = {"text": 5.0, "sticker": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5, "connector": 0.5, "image": 0.5,
        "note_color": 3.0, "ink": 0.5, "ink_width": 0.1}
 
 
@@ -134,6 +134,7 @@ BASELINE = r"""(el, rect) => {
 # ----------------------------------------------------------------------------------------
 JS_HTML = (r"""() => {
   const cal = [], texts = [], stickers = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [];
+  const images = [], connectors = [];
   const baseline = BASELINE;
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   document.querySelectorAll('div.anchor[data-whiteboard-type]').forEach(a => {
@@ -142,9 +143,15 @@ JS_HTML = (r"""() => {
     if (L && T && !/transform/.test(st)) cal.push([+L[1], +T[1], r.left + scrollX, r.top + scrollY]);
     const type = a.dataset.whiteboardType;
     const spans = [...a.querySelectorAll('span[data-text="true"]')];
-    const t = spans.map(s => s.textContent).join('');
+    // Each Draft.js block (<div data-block>) is a paragraph: one line break between blocks.
+    const blocks = [...a.querySelectorAll('div[data-block="true"]')];
+    const t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
+                            : spans.map(s => s.textContent).join('');
     if (t.trim()) {
-      const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
+      // The first paragraph only: a Range across several Draft.js blocks also spans the blocks'
+      // own boxes, so it is the column's full width (the output side stops at the first <br>).
+      const para = blocks.length ? [...blocks[0].querySelectorAll('span[data-text="true"]')] : [];
+      const rg = document.createRange(), last = para.length ? para[para.length - 1] : spans[spans.length - 1], lf = last.firstChild || last;
       rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
       const b = rg.getBoundingClientRect(), [x, y] = baseline(spans[0], b);
       texts.push({type, text: t, x: x + scrollX, y: y + scrollY, w: b.width, h: b.height});
@@ -180,6 +187,34 @@ JS_HTML = (r"""() => {
       const m = p.getScreenCTM(), n = p.getTotalLength();
       arrows.push([0, n / 2, n].map(l => { const q = p.getPointAtLength(l); return pt(m, q.x, q.y); }));
     });
+    // The connector's line, sampled every 0.5 px so samples cut an elbow's corners by no more
+    // than 0.35 px (a zero-length line draws nothing).
+    if (type === 'Connector') {
+      const p = a.querySelector('svg g > path:not([transform])');
+      const len = p ? p.getTotalLength() : 0;
+      if (len > 0) {
+        const n = Math.max(2, Math.ceil(len / 0.5)), m = p.getScreenCTM(), pts = [];
+        for (let i = 0; i <= n; i++) { const q = p.getPointAtLength(len * i / n); pts.push(pt(m, q.x, q.y)); }
+        connectors.push(pts);
+      }
+    }
+    // An image's top-left, top-right and bottom-left corners, read from zero-size markers
+    // laid on its corners, so rotation and scale come from the browser's own transform.
+    if (['Image', 'AzureImage', 'FluidImage'].includes(type)) {
+      const img = a.querySelector('img');
+      if (img) {
+        // The used size, unrounded (offsetWidth/offsetHeight are whole px: 578 for 577.535,
+        // 2 px at SailboatRetrospective's 4.38x scale).
+        const host = img.parentElement; host.style.position = 'relative';
+        const W = parseFloat(getComputedStyle(img).width), H = parseFloat(getComputedStyle(img).height);
+        images.push([[0, 0], [1, 0], [0, 1]].map(([u, v]) => {
+          const k = document.createElement('div');
+          k.style.cssText = 'position:absolute;width:0;height:0;left:' + (img.offsetLeft + u * W) + 'px;top:' + (img.offsetTop + v * H) + 'px';
+          host.append(k); const q = k.getBoundingClientRect(); k.remove();
+          return [q.left + scrollX, q.top + scrollY];
+        }));
+      }
+    }
   });
   // The anchor divs themselves are 0 x 0 (their content overflows them), so take the union
   // of everything drawn inside them; comment threads are not board objects.
@@ -187,7 +222,7 @@ JS_HTML = (r"""() => {
               .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
-  return {cal, texts, stickers, shapes, arrows, notes, noteStyles, inks, bbox};
+  return {cal, texts, stickers, shapes, arrows, notes, noteStyles, inks, images, connectors, bbox};
 }""").replace("BASELINE", BASELINE, 1)
 
 
@@ -217,6 +252,8 @@ def measure_html(page, html: Path, shot: Path) -> dict:
         "note_paints": [note_paint(s) for s in d["noteStyles"]],
         "shapes": [{"label": s["label"], "pts": [to_b(*q) for q in s["pts"]]} for s in d["shapes"]],
         "arrows": [[to_b(*q) for q in a] for a in d["arrows"]],
+        "connectors": [[to_b(*q) for q in c] for c in d["connectors"]],
+        "images": [[to_b(*q) for q in c] for c in d["images"]],
         "inks": [{"pts": [to_b(*q) for q in s["pts"]], "w": s["w"] / kx if s["w"] else None} for s in d["inks"]],
     }
 
@@ -316,9 +353,27 @@ def browser_svg(z: zipfile.ZipFile, raw: str) -> str:
     return re.sub(r"^<\?xml[^>]*>\s*", "", s)
 
 
+# Qt's proportional line height ("line-height: 140%" in the itemTextContent) spaces lines by
+# that percentage of the font's ascent + descent and leaves the first baseline where it is; CSS
+# would also move the first line by half the difference (half-leading). So each such
+# paragraph gets that line height in px and a negative top margin that cancels the move.
+JS_QT_LINE_HEIGHT = r"""() => document.querySelectorAll('foreignObject p').forEach(p => {
+  const m = /line-height:\s*([\d.]+)%/.exec(p.getAttribute('style') || ''); if (!m) return;
+  p.style.lineHeight = 'normal';
+  const s = document.createElement('span'); s.textContent = 'x'; p.prepend(s);
+  const content = s.offsetHeight; s.remove();
+  const d = document.createElement('div'); d.textContent = 'x'; p.prepend(d);
+  const normal = d.offsetHeight; d.remove();
+  const L = parseFloat(m[1]) / 100 * content;
+  p.style.lineHeight = L + 'px'; p.style.marginTop = (-(L - normal) / 2) + 'px';
+})"""
+
+
 JS_SVG = r"""() => [...document.querySelectorAll('foreignObject')].map(fo => {
   const p = fo.querySelector('p'); if (!p || !p.firstChild) return null;
-  const rg = document.createRange(); rg.selectNodeContents(p.firstChild);
+  // The text up to the first <br>: the first paragraph, as on the HTML side.
+  const br = [...p.childNodes].findIndex(n => n.nodeName.toLowerCase() === 'br');
+  const rg = document.createRange(); rg.setStart(p, 0); rg.setEnd(p, br < 0 ? p.childNodes.length : br);
   const r = rg.getBoundingClientRect(), svg = document.querySelector('svg'), m = svg.getScreenCTM().inverse();
   const P = (x, y) => { const q = svg.createSVGPoint(); q.x = x; q.y = y; return q.matrixTransform(m); };
   // The first line's baseline, measured as on the HTML side.
@@ -342,16 +397,22 @@ def measure_ubz(page, ubz: Path, shot: Path) -> dict:
     page.set_content("<html><body style='margin:0;background:#fff'>"
                      + browser_svg(z, raw).replace("<svg ", f"<svg width='{w}' height='{h}' ", 1) + "</body></html>")
     page.wait_for_timeout(600)
+    page.evaluate(JS_QT_LINE_HEIGHT)
     page.screenshot(path=str(shot), full_page=True)
     texts = [dict(t, bx=t["x"] + cx, by=t["y"] + cy) for t in page.evaluate(JS_SVG)]
 
-    stickers, groups, lines, notes, note_polys, inks = [], {}, set(), [], [], []
+    stickers, images, groups, lines, notes, note_polys, inks = [], [], {}, {}, [], [], []
     pts_of = lambda el: [(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())]
     for el in root:
         tag = el.tag.replace(SVG, "")
-        if tag == "image" and el.get(XLINK_HREF, "").endswith(".svg"):
-            m = [float(v) for v in re.findall(r"-?[\d.]+(?:[eE]-?\d+)?", el.get("transform"))]
-            stickers.append((m[4] + cx, m[5] + cy, float(el.get("width")) * m[0], float(el.get("height")) * m[3]))
+        if tag == "image":
+            m = [float(v) for v in re.findall(r"-?[\d.]+(?:[eE][-+]?\d+)?", el.get("transform"))]
+            w, h = float(el.get("width")), float(el.get("height"))
+            if el.get(XLINK_HREF, "").endswith(".svg"):
+                stickers.append((m[4] + cx, m[5] + cy, w * m[0], h * m[3]))
+            else:   # top-left, top-right and bottom-left corners, through the full matrix
+                images.append([(m[4] + cx, m[5] + cy), (m[4] + m[0] * w + cx, m[5] + m[1] * w + cy),
+                               (m[4] + m[2] * h + cx, m[5] + m[3] * h + cy)])
         par = el.get(UB_PARENT)
         if tag == "polyline" and el.get("stroke-linejoin") == "round":   # ink stroke
             inks.append({"pts": pts_of(el), "w": float(el.get("stroke-width"))})
@@ -360,18 +421,26 @@ def measure_ubz(page, ubz: Path, shot: Path) -> dict:
             notes.append(pts_of(el))
             note_polys.append([(pts_of(el), hex_rgb(el.get("fill")))])
         if tag in ("polygon", "polyline") and par:
-            pts = [(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())]
-            g = groups.setdefault(par, {"polygon": 0, "polyline": 0})
+            g = groups.setdefault(par, {"polygon": 0, "polyline": 0, "polylines": []})
             g[tag] += 1
-            g.setdefault(tag + "_pts", pts[:-1] if tag == "polyline" else pts)
+            if tag == "polyline":
+                g["polylines"].append(pts_of(el))
+            g.setdefault(tag + "_pts", pts_of(el)[:-1] if tag == "polyline" else pts_of(el))
         if tag == "line" and par:
-            lines.add(par)
-    # A shape = a group with at most one fill polygon (v3 gradient notes have many bands).
-    shapes = [g.get("polyline_pts", g.get("polygon_pts")) for k, g in groups.items()
-              if k not in lines and g["polygon"] <= 1]
-    arrows = [g_pts for par in lines for g_pts in
-              [pts for el in root if el.tag == SVG + "polyline" and el.get(UB_PARENT) == par
-               for pts in [[(float(a) + cx, float(b) + cy) for a, b in (xy.split(",") for xy in el.get("points").split())]]]]
+            lines[par] = [(float(el.get("x1")) + cx, float(el.get("y1")) + cy), (float(el.get("x2")) + cx, float(el.get("y2")) + cy)]
+    # A connector = a group with a <line>, or with only open polylines (an elbow or curved
+    # connector's line is a polyline, written first, then its arrowheads); shape outlines are
+    # closed. A shape = any other group with at most one fill polygon (v3 gradient notes have
+    # many bands).
+    connectors, arrows, shapes = [], [], []
+    for k, g in list(groups.items()) + [(k, None) for k in lines if k not in groups]:
+        polys = g["polylines"] if g else []
+        if k in lines:
+            connectors.append(lines[k]); arrows += polys
+        elif g["polygon"] == 0 and polys and all(math.dist(p[0], p[-1]) > 0.01 for p in polys):
+            connectors.append(polys[0]); arrows += polys[1:]
+        elif g["polygon"] <= 1:
+            shapes.append(g.get("polyline_pts", g.get("polygon_pts")))
     # v3 note: one group of gradient bands (each band but the last overlaps the next, inside
     # the note).
     for par in {el.get(UB_PARENT) for el in root if el.tag == SVG + "polygon" and el.get(UB_PARENT)}:
@@ -385,7 +454,7 @@ def measure_ubz(page, ubz: Path, shot: Path) -> dict:
     note_boxes = [(min(p[0] for p in n), min(p[1] for p in n),
                    max(p[0] for p in n) - min(p[0] for p in n), max(p[1] for p in n) - min(p[1] for p in n)) for n in notes]
     return {"texts": texts, "stickers": stickers, "notes": note_boxes, "note_polys": note_polys,
-            "shapes": shapes, "arrows": arrows, "inks": inks}
+            "shapes": shapes, "arrows": arrows, "inks": inks, "connectors": connectors, "images": images}
 
 
 # ----------------------------------------------------------------------------------------
@@ -460,10 +529,23 @@ def compare(src: dict, out: dict, solid_only: bool) -> dict:
         best = min((max(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(s, o)) for o in out["arrows"]), default=None)
         if best is not None: ae.append(best)
     res["arrow"] = {"expected": len(src["arrows"]), "matched": len(out["arrows"]), "max": round(max(ae), 2) if ae else None}
+    # Connector lines: pair each true line with the output line nearest its ends; largest
+    # distance either way between the two.
+    ce, pool = [], list(out["connectors"])
+    for s in src["connectors"]:
+        if not pool: break
+        j = min(range(len(pool)), key=lambda i: min(math.dist(pool[i][0], s[0]) + math.dist(pool[i][-1], s[-1]),
+                                                   math.dist(pool[i][0], s[-1]) + math.dist(pool[i][-1], s[0])))
+        o = pool.pop(j)
+        ce.append(max(max(path_dist(p, o) for p in s), max(path_dist(p, s) for p in o)))
+    res["connector"] = {"expected": len(src["connectors"]), "matched": len(out["connectors"]), "max": round(max(ce), 2) if ce else None, "rows": [round(e, 2) for e in ce]}
+    # Images: same order; largest corner distance (catches rotation, mirroring and scale).
+    ie2 = [max(math.dist(a, b) for a, b in zip(s, o)) for s, o in zip(src["images"], out["images"])]
+    res["image"] = {"expected": len(src["images"]), "matched": len(out["images"]), "max": round(max(ie2), 2) if ie2 else None}
     fails = []
     if res["text"]["matched"] < res["text"]["expected"]: fails.append("missing text")
     if res["text"]["max"] is not None and res["text"]["max"] > TOL["text"]: fails.append(f"text off by {res['text']['max']} px")
-    for k in ("sticker", "note", "shape", "arrow", "ink"):
+    for k in ("sticker", "note", "shape", "connector", "arrow", "image", "ink"):
         if res[k]["matched"] != res[k]["expected"]: fails.append(f"{k} count {res[k]['matched']}/{res[k]['expected']}")
         if res[k]["max"] is not None and res[k]["max"] > TOL[k]: fails.append(f"{k} off by {res[k]['max']} px")
     if res["note_color"]["max"] is not None and res["note_color"]["max"] > TOL["note_color"]:
@@ -485,14 +567,14 @@ def write_report(out_root: Path, results: list[dict]):
             return f"<td>{v['matched']}/{v['expected']} · median {v['median']} / max {v['max']}</td>"
         if k == "note_color":
             return f"<td>{v['max'] if v['max'] is not None else '—'}</td>"
-        if k == "ink" and not v["expected"] and not v["matched"]:
+        if k in ("ink", "connector", "image") and not v["expected"] and not v["matched"]:
             return "<td>—</td>"
         if k == "ink":
             return f"<td>{v['matched']}/{v['expected']} · max {v['max']} · width {v['width']}</td>"
         return f"<td>{v['matched']}/{v['expected']}" + (f" · max {v['max']}" if v['max'] is not None else "") + "</td>"
     rows = "".join(
         f"<tr class='{'bad' if r['status'] != 'PASS' else ''}'><td>{r['board']}</td><td>{r['version']}</td><td>{r['status']}</td>"
-        + "".join(cell(r, k) for k in ("text", "sticker", "note", "note_color", "shape", "arrow", "ink"))
+        + "".join(cell(r, k) for k in ("text", "sticker", "note", "note_color", "shape", "connector", "arrow", "image", "ink"))
         + f"<td>{'; '.join(r.get('fails', []))}</td></tr>" for r in results)
     boards = sorted({r["board"] for r in results})
     figs = ""
@@ -509,9 +591,9 @@ th{{background:#f1eff6}} tr.bad td{{background:#fde8e8}} .grid{{display:grid;gri
 figure{{margin:0;background:#f1eff6;padding:6px;border-radius:6px}} img{{width:100%;background:#fff}}
 figcaption{{font-size:12px;color:#666;text-align:center}}</style></head><body>
 <h1>Whiteboard → OpenBoard visual checks</h1>
-<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, sticker {TOL['sticker']}, note {TOL['note']}, shape {TOL['shape']}, arrowhead {TOL['arrow']}, ink {TOL['ink']} (width {TOL['ink_width']}); note colour {TOL['note_color']}/255.
+<p>{time.strftime('%Y-%m-%d %H:%M')} · errors in board px · tolerances: text {TOL['text']}, sticker {TOL['sticker']}, note {TOL['note']}, shape {TOL['shape']}, connector {TOL['connector']}, arrowhead {TOL['arrow']}, image {TOL['image']}, ink {TOL['ink']} (width {TOL['ink_width']}); note colour {TOL['note_color']}/255.
 Renders show the .ubz page as OpenBoard lays it out (approximation in Chromium).</p>
-<table><tr><th>Board</th><th>Script</th><th>Status</th><th>Text</th><th>Stickers</th><th>Notes</th><th>Note colour</th><th>Shapes</th><th>Arrowheads</th><th>Ink</th><th>Problems</th></tr>{rows}</table>
+<table><tr><th>Board</th><th>Script</th><th>Status</th><th>Text</th><th>Stickers</th><th>Notes</th><th>Note colour</th><th>Shapes</th><th>Connectors</th><th>Arrowheads</th><th>Images</th><th>Ink</th><th>Problems</th></tr>{rows}</table>
 {figs}</body></html>"""
     (out_root / "report.html").write_text(doc, encoding="utf-8")
 
@@ -560,7 +642,8 @@ def main():
                 c = r.get("checks", {})
                 print(f"{d.name:24} {v:12} {r['status']:5}  text max {c.get('text', {}).get('max')}  "
                       f"sticker {c.get('sticker', {}).get('max')}  note {c.get('note', {}).get('max')}  shape {c.get('shape', {}).get('max')}  "
-                      f"arrow {c.get('arrow', {}).get('max')}  note colour {c.get('note_color', {}).get('max')}  "
+                      f"connector {c.get('connector', {}).get('max')}  arrow {c.get('arrow', {}).get('max')}  "
+                      f"image {c.get('image', {}).get('max')}  note colour {c.get('note_color', {}).get('max')}  "
                       f"ink {c.get('ink', {}).get('max')}  {'; '.join(r.get('fails', []))}", flush=True)
         browser.close()
     (a.out / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")

@@ -65,11 +65,16 @@ function Get-SourceExpectations {
     $html = [IO.File]::ReadAllText($HtmlPath, [Text.Encoding]::UTF8)
     $starts = [regex]::Matches($html, '(?=<div\s+class="anchor\b)', 'IgnoreCase')
     $texts = New-Object Collections.Generic.List[string]
-    $counts = @{ Shape = 0; Oval = 0; Sticker = 0; Arrowhead = 0; Rotated = 0; RotatedText = 0; RotatedShape = 0 }
-    # Span text as a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF.
+    $counts = @{ Shape = 0; Oval = 0; Sticker = 0; Arrowhead = 0; Rotated = 0; RotatedText = 0; RotatedShape = 0; RotatedImage = 0 }
+    # Span text as a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF,
+    # and each Draft.js block (<div data-block="true">) is a paragraph of its own.
     $spanText = { param($b)
-        $spans = [regex]::Matches($b, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
-        ((@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '') -replace "`r`n?", "`n") }
+        $paras = @([regex]::Matches($b, '<div\b[^>]*\bdata-block="true"[^>]*>(.*?)(?=<div\b[^>]*\bdata-block="true"|$)', $RxOpts) | ForEach-Object { $_.Groups[1].Value })
+        if ($paras.Count -eq 0) { $paras = @($b) }
+        (@($paras | ForEach-Object {
+            $spans = [regex]::Matches($_, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
+            (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '')
+        }) -join "`n") -replace "`r`n?", "`n" }
     for ($i = 0; $i -lt $starts.Count; $i++) {
         $start = $starts[$i].Index
         $end = if ($i + 1 -lt $starts.Count) { $starts[$i + 1].Index } else { $html.Length }
@@ -84,7 +89,10 @@ function Get-SourceExpectations {
                 # PlainText and shapes are drawn rotated (a shape's label turns with it).
                 if ($type -eq 'PlainText') { $counts.RotatedText++ }
                 elseif ($type -eq 'Shape') { $counts.RotatedShape++; if ((& $spanText $block).Trim()) { $counts.RotatedText++ } }
-                else { $counts.Rotated++ }
+                # Images and stickers are drawn rotated too, and connectors and ink are mapped
+                # through the full matrix; only notes are left unrotated.
+                elseif ($type -in 'Image', 'AzureImage', 'FluidImage', 'ReactionStickers') { $counts.RotatedImage++ }
+                elseif ($type -notin 'Connector', 'InkGroup') { $counts.Rotated++ }
             }
         }
         switch ($type) {
@@ -105,7 +113,7 @@ function Get-SourceExpectations {
     }
     [pscustomobject]@{ Texts = $texts; Shapes = $counts.Shape; Ovals = $counts.Oval; Stickers = $counts.Sticker
                        Arrowheads = $counts.Arrowhead; RotatedNonText = $counts.Rotated; RotatedText = $counts.RotatedText
-                       RotatedShapes = $counts.RotatedShape }
+                       RotatedShapes = $counts.RotatedShape; RotatedImages = $counts.RotatedImage }
 }
 
 # ------------------------------------------------------------------------------------------
@@ -217,12 +225,26 @@ function Test-Ubz {
         }
         if ($roundGroups.Count -lt $Expect.Ovals) { Add-Issue 'FAIL' "ovals: export has $($Expect.Ovals), only $($roundGroups.Count) drawn round" }
 
-        # Arrowheads: 3-point polylines sharing a ub:parent with a connector <line>.
+        # Arrowheads: polylines sharing a ub:parent with a connector -- a <line>, or (for an
+        # elbow or curved connector) the group's first polyline, when the group has no fill
+        # and only open polylines (shape outlines are closed).
         $lineGroups = @{}
         foreach ($l in $svg.SelectNodes('//s:line[@ub:parent]', $ns)) { $lineGroups[$l.GetAttribute('parent', $UB_NS)] = $true }
+        $polyGroups = [ordered]@{}; $filled = @{}
+        foreach ($n in $svg.SelectNodes('//s:polygon[@ub:parent] | //s:polyline[@ub:parent]', $ns)) {
+            $par = $n.GetAttribute('parent', $UB_NS)
+            if ($n.LocalName -eq 'polygon') { $filled[$par] = $true; continue }
+            if ($n.GetAttribute('stroke-linejoin') -eq 'round') { continue }   # ink
+            if (-not $polyGroups.Contains($par)) { $polyGroups[$par] = New-Object Collections.Generic.List[object] }
+            $polyGroups[$par].Add($n)
+        }
         $arrows = 0
-        foreach ($pl in $svg.SelectNodes('//s:polyline[@ub:parent]', $ns)) {
-            if ($lineGroups.ContainsKey($pl.GetAttribute('parent', $UB_NS))) { $arrows++ }
+        foreach ($par in $polyGroups.Keys) {
+            $pls = $polyGroups[$par]
+            if ($lineGroups.ContainsKey($par)) { $arrows += $pls.Count; continue }
+            if ($filled.ContainsKey($par)) { continue }
+            $open = @($pls | Where-Object { $p = @($_.GetAttribute('points') -split '\s+' | Where-Object { $_ }); $p[0] -ne $p[$p.Count - 1] }).Count
+            if ($open -eq $pls.Count) { $arrows += $pls.Count - 1 }
         }
         if ($arrows -ne $Expect.Arrowheads) { Add-Issue 'FAIL' "arrowheads: export has $($Expect.Arrowheads), .ubz has $arrows" }
 
@@ -236,7 +258,17 @@ function Test-Ubz {
             }
         }
         if ($rotated -ne $Expect.RotatedText) { Add-Issue 'FAIL' "rotated text: export has $($Expect.RotatedText), .ubz has $rotated" }
-        if ($Expect.RotatedNonText -gt 0) { Add-Issue 'WARN' "$($Expect.RotatedNonText) rotated non-shape object(s) in the export (drawn unrotated)" }
+        # Rotated images and stickers: an image whose matrix has off-diagonal terms.
+        $rotatedImages = 0
+        foreach ($img in $svg.SelectNodes('//s:image', $ns)) {
+            $t = [regex]::Match($img.GetAttribute('transform'), 'matrix\(([^)]+)\)')
+            if ($t.Success) {
+                $m = @($t.Groups[1].Value -split '\s*,\s*' | ForEach-Object { [double]$_ })
+                if ([Math]::Abs($m[1]) -gt 1e-6 -or [Math]::Abs($m[2]) -gt 1e-6 -or $m[0] -lt 0 -or $m[3] -lt 0) { $rotatedImages++ }
+            }
+        }
+        if ($rotatedImages -ne $Expect.RotatedImages) { Add-Issue 'FAIL' "rotated images/stickers: export has $($Expect.RotatedImages), .ubz has $rotatedImages" }
+        if ($Expect.RotatedNonText -gt 0) { Add-Issue 'WARN' "$($Expect.RotatedNonText) rotated note(s) in the export (drawn unrotated)" }
 
         # ---- Converter's own counters, when this version reports them ----
         $prop = { param($name) if ($RunResult -and $RunResult.PSObject.Properties[$name]) { $RunResult.$name } else { $null } }

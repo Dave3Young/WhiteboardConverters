@@ -108,7 +108,42 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path):
 # ----------------------------------------------------------------------------------------
 # Whiteboard side: measure the export in the browser
 # ----------------------------------------------------------------------------------------
-JS_HTML = r"""() => {
+# A text element's first-line baseline in screen y, as an unrounded renderer would place it
+# (JS function source). Text y is compared there on both sides, not at the Range box top: that
+# is the content-area top, which includes CSS half-leading that Chromium rounds to whole px.
+# Chromium also rounds the ascent to whole px at the font size it lays out, and Whiteboard lays
+# out at 34 px and scales while the stand-in lays out at the final size, so even the drawn
+# baselines differ by up to 0.5 px x scale (2.1 px on KWL's 187 px letters). So this takes the
+# line top (a zero-size vertical-align:top marker) plus the drawn top-to-baseline distance
+# (a zero-size baseline marker), rescaled by the unrounded distance over Chromium's rounded one,
+# both read from unscaled probes of the same font (the unrounded one at 1000 px). A probe needs
+# text: in quirks mode (no doctype) a line of only empty inline-blocks gets no strut.
+# Returns screen [x, y]: the baseline across the line, the Range rect `rect` along it, so a
+# label rotated by 90 degrees is measured across its line in x.
+BASELINE = r"""(el, rect) => {
+  const cs = getComputedStyle(el), F = parseFloat(cs.fontSize);
+  const lh = cs.lineHeight === 'normal' ? 'normal' : String(parseFloat(cs.lineHeight) / F);
+  const mark = va => { const k = document.createElement('span');
+    k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0;vertical-align:' + va; return k; };
+  // Word joiners keep both markers on the first glyph's line: an inline-block is a break
+  // opportunity, and a glyph wider than its column (KWL's "W") would wrap away from them.
+  const span = host => { const t = mark('top'), b = mark('baseline');
+    const j = [0, 1].map(() => document.createTextNode('\u2060'));
+    host.insertBefore(j[1], host.firstChild); host.insertBefore(b, j[1]); host.insertBefore(j[0], b); host.insertBefore(t, j[0]);
+    const p = t.getBoundingClientRect(), q = b.getBoundingClientRect();
+    [t, b, ...j].forEach(n => n.remove()); return [p.left, p.top, q.left, q.bottom]; };
+  const probe = size => { const d = document.createElement('div');
+    d.style.cssText = 'position:absolute;left:0;top:0;margin:0;padding:0;border:0;white-space:nowrap;font-family:'
+      + cs.fontFamily + ';font-weight:' + cs.fontWeight + ';font-style:' + cs.fontStyle + ';font-size:' + size + 'px;line-height:' + lh;
+    d.textContent = 'x'; document.body.append(d); const s = span(d); d.remove(); return s[3] - s[1]; };
+  const [tx, ty, bx, by] = span(el), drawn = probe(F), k = drawn > 0 ? probe(1000) / 1000 * F / drawn : 1;
+  const x = tx + (bx - tx) * k, y = ty + (by - ty) * k;
+  return Math.abs(by - ty) >= Math.abs(bx - tx) ? [rect.left, y] : [x, rect.top];
+}"""
+
+
+JS_HTML = (r"""() => {
+  const baseline = BASELINE;
   const cal = [], texts = [], stickers = [], shapes = [], arrows = [], connectors = [], notes = [], images = [];
   const noteStyles = [], inks = [];
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
@@ -119,7 +154,10 @@ JS_HTML = r"""() => {
     if (L && T && !/transform/.test(st)) cal.push([+L[1], +T[1], r.left + scrollX, r.top + scrollY]);
     const type = a.dataset.whiteboardType;
     const spans = [...a.querySelectorAll('span[data-text="true"]')];
-    const t = spans.map(s => s.textContent).join('');
+    // Each Draft.js block (<div data-block>) is a paragraph: one line break between blocks.
+    const blocks = [...a.querySelectorAll('div[data-block="true"]')];
+    const t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
+                            : spans.map(s => s.textContent).join('');
     if (t.trim()) {
       // Union of the visible characters' boxes. A range over the whole text would include the
       // spaces pre-wrap keeps at the end of a wrapped line; they hang past the column and are
@@ -135,10 +173,14 @@ JS_HTML = r"""() => {
           }
         }
       });
-      texts.push({type, text: t, x: x0 + scrollX, y: y0 + scrollY, w: x1 - x0, h: y1 - y0});
+      // y is compared at the first line's baseline (unrounded font metrics, as on the
+      // Excalidraw side): the glyph box top depends on the face, and Excalidraw draws every
+      // text in Helvetica -- Segoe Print's 1.25 em ascent put its box 15 px above Helvetica's.
+      const base = baseline(spans[0], spans[0].getBoundingClientRect())[1];
+      texts.push({type, text: t, x: x0 + scrollX, y: y0 + scrollY, w: x1 - x0, h: y1 - y0, base: base + scrollY});
     }
     if (type === 'ReactionStickers') stickers.push(box(a.querySelector('img').getBoundingClientRect()));
-    if (type === 'Image' || type === 'AzureImage') images.push(box(a.querySelector('img').getBoundingClientRect()));
+    if (['Image', 'AzureImage', 'FluidImage'].includes(type)) images.push(box(a.querySelector('img').getBoundingClientRect()));
     if (type === 'Note') {
       const bg = a.querySelector('.textBoxBackground'), cs = getComputedStyle(bg);
       notes.push(box(bg.getBoundingClientRect()));
@@ -163,10 +205,13 @@ JS_HTML = r"""() => {
       }
     }
     if (type === 'Connector') {
-      const line = a.querySelector('svg g path:not([transform])');
-      if (line) {
-        const m = line.getScreenCTM(), n = line.getTotalLength(), q0 = line.getPointAtLength(0), q1 = line.getPointAtLength(n);
-        connectors.push([pt(m, q0.x, q0.y), pt(m, q1.x, q1.y)]);
+      // The whole line, sampled every 0.5 px so samples cut an elbow's corners by no more
+      // than 0.35 px (a zero-length line draws nothing).
+      const line = a.querySelector('svg g path:not([transform])'), len = line ? line.getTotalLength() : 0;
+      if (len > 0) {
+        const n = Math.max(2, Math.ceil(len / 0.5)), m = line.getScreenCTM(), pts = [];
+        for (let i = 0; i <= n; i++) { const q = line.getPointAtLength(len * i / n); pts.push(pt(m, q.x, q.y)); }
+        connectors.push(pts);
       }
       a.querySelectorAll('svg g path[transform]').forEach(p => {
         const m = p.getScreenCTM(), n = p.getTotalLength();
@@ -181,7 +226,7 @@ JS_HTML = r"""() => {
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
   return {cal, texts, stickers, shapes, arrows, connectors, notes, images, noteStyles, inks, bbox};
-}"""
+}""").replace("BASELINE", BASELINE, 1)
 
 
 def linfit(xs, ys):
@@ -205,7 +250,8 @@ def measure_html(page, html: Path, shot: Path) -> dict:
     to_b = lambda x, y: ((x - ox) / kx, (y - oy) / ky)
     to_box = lambda b: (*to_b(b[0], b[1]), b[2] / kx, b[3] / ky)
     return {
-        "texts": [dict(t, bx=to_b(t["x"], t["y"])[0], by=to_b(t["x"], t["y"])[1], bw=t["w"] / kx, bh=t["h"] / ky)
+        "texts": [dict(t, bx=to_b(t["x"], t["y"])[0], by=to_b(t["x"], t["y"])[1], bw=t["w"] / kx, bh=t["h"] / ky,
+                       bbase=to_b(t["x"], t["base"])[1])
                   for t in d["texts"]],
         "stickers": [to_box(s) for s in d["stickers"]],
         "notes": [to_box(s) for s in d["notes"]],
@@ -321,7 +367,7 @@ JS_TEXT = r"""(els) => {
     // Excalidraw draws "text" line by line with fillText and never re-wraps it: anything
     // past the element's width is clipped.
     const widest = Math.max(...e.text.split('\n').map(l => ctx.measureText(l.trimEnd()).width));
-    return {text: e.originalText, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height,
+    return {text: e.originalText, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height, base: e.y + exBase,
             align: e.textAlign, angle: e.angle || 0, overflow: widest - e.width};
   });
 }"""
@@ -417,7 +463,7 @@ def measure_scene(page, scene_path: Path, off) -> dict:
     conns, arrows = [], []
     for e in linear:
         pts = [(e["x"] + off[0] + p[0], e["y"] + off[1] + p[1]) for p in e["points"]]
-        conns.append([pts[0], pts[-1]])
+        conns.append(pts)
         if e["type"] == "arrow":
             if e.get("startArrowhead"): arrows.append((pts[0], pts[1], e["startArrowhead"]))
             if e.get("endArrowhead"): arrows.append((pts[-1], pts[-2], e["endArrowhead"]))
@@ -524,7 +570,7 @@ def compare(src: dict, out: dict, solid_only: bool) -> dict:
     res = {}
     # Texts: match by exact text, in order. Excalidraw drops bold and the font face, so line
     # widths differ; x is compared at the alignment anchor (left edge, centre or right edge),
-    # y at the top of the glyph box. Rotated text is compared by the centre of its bounds.
+    # y at the first line's baseline. Rotated text is compared by the centre of its bounds.
     pool = list(out["texts"]); rows = []
     for s in src["texts"]:
         j = next((i for i, o in enumerate(pool) if o["text"] == s["text"]), None)
@@ -535,7 +581,7 @@ def compare(src: dict, out: dict, solid_only: bool) -> dict:
             dx = (o["x"] + o["w"] / 2) - (s["bx"] + s["bw"] / 2); dy = (o["y"] + o["h"] / 2) - (s["by"] + s["bh"] / 2)
         else:
             k = {"left": 0.0, "center": 0.5, "right": 1.0}.get(o["align"], 0.0)
-            dx = (o["x"] + k * o["w"]) - (s["bx"] + k * s["bw"]); dy = o["y"] - s["by"]
+            dx = (o["x"] + k * o["w"]) - (s["bx"] + k * s["bw"]); dy = o["base"] - s["bbase"]
         # Bottom-edge difference: shows line-spacing drift on multi-line text (informational --
         # wrapping can legitimately differ because bold and the font face are dropped).
         rows.append({"text": s["text"][:50], "dx": round(dx, 1), "dy": round(dy, 1), "err": round(math.hypot(dx, dy), 1),
@@ -592,11 +638,15 @@ def compare(src: dict, out: dict, solid_only: bool) -> dict:
     res["shape"] = {"expected": len(src["shapes"]), "matched": len(out["shapes"]),
                     "max": max((r["dev"] for r in sh), default=None),
                     "over": sum(1 for r in sh if r["dev"] > r["allowed"]), "rows": sh}
-    # Connectors: both endpoints, in order.
-    ce = []
+    # Connectors: each true line against the output line nearest its ends; largest distance
+    # either way between the two, so every bend of an elbow connector counts.
+    ce, pool = [], list(out["connectors"])
     for s in src["connectors"]:
-        best = min((max(math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in zip(s, o)) for o in out["connectors"]), default=None)
-        if best is not None: ce.append(best)
+        if not pool: break
+        j = min(range(len(pool)), key=lambda i: min(math.dist(pool[i][0], s[0]) + math.dist(pool[i][-1], s[-1]),
+                                                   math.dist(pool[i][0], s[-1]) + math.dist(pool[i][-1], s[0])))
+        o = pool.pop(j)
+        ce.append(max(max(path_dist(p, o) for p in s), max(path_dist(p, s) for p in o)))
     res["connector"] = {"expected": len(src["connectors"]), "matched": len(out["connectors"]), "max": round(max(ce), 2) if ce else None}
     # Arrowheads: the chevron's tip must be an arrowhead end, pointing the same way.
     ae, angle_bad = [], 0
