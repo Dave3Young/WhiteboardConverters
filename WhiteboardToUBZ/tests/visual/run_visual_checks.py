@@ -100,6 +100,12 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path) -> tuple[Pat
 # ----------------------------------------------------------------------------------------
 JS_HTML = r"""() => {
   const cal = [], texts = [], stickers = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [];
+  // y is the first line's baseline: the bottom of a zero-size inline-block put before the first
+  // glyph. The Range box top would be the content-area top, which includes CSS half-leading that
+  // Chromium rounds to whole px at the rendered font size (2-3 px on large headings).
+  const baseline = el => { const k = document.createElement('span');
+    k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0';
+    el.insertBefore(k, el.firstChild); const y = k.getBoundingClientRect().bottom; k.remove(); return y; };
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   document.querySelectorAll('div.anchor[data-whiteboard-type]').forEach(a => {
     const st = a.getAttribute('style') || '', r = a.getBoundingClientRect();
@@ -111,8 +117,8 @@ JS_HTML = r"""() => {
     if (t.trim()) {
       const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
       rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
-      const b = rg.getBoundingClientRect();
-      texts.push({type, text: t, x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height});
+      const b = rg.getBoundingClientRect(), y = baseline(spans[0]);
+      texts.push({type, text: t, x: b.left + scrollX, y: y + scrollY, w: b.width, h: b.height});
     }
     if (type === 'ReactionStickers') {
       const i = a.querySelector('img').getBoundingClientRect();
@@ -272,9 +278,11 @@ def browser_svg(z: zipfile.ZipFile, raw: str) -> str:
         data = base64.b64encode(z.read(href)).decode()
         return f'xlink:href="data:image/{mime};base64,{data}" preserveAspectRatio="none"'
     s = re.sub(r'xlink:href="(images/[^"]+)"', inline, raw)
+    # OpenBoard's text item keeps QTextDocument's default 4px documentMargin: the text sits 4px in
+    # from the item's left and top, and wraps at the item width minus 8px. The padding models that.
     s = re.sub(r"<itemTextContent>(.*?)</itemTextContent>",
                lambda m: '<div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;overflow:visible;'
-                         'overflow-wrap:break-word">' + htmllib.unescape(m.group(1)).replace("&nbsp;", "&#160;") + "</div>",
+                         'box-sizing:border-box;padding:4px;overflow-wrap:break-word">' + htmllib.unescape(m.group(1)).replace("&nbsp;", "&#160;") + "</div>",
                s, flags=re.S)
     return re.sub(r"^<\?xml[^>]*>\s*", "", s)
 
@@ -284,10 +292,14 @@ JS_SVG = r"""() => [...document.querySelectorAll('foreignObject')].map(fo => {
   const rg = document.createRange(); rg.selectNodeContents(p.firstChild);
   const r = rg.getBoundingClientRect(), svg = document.querySelector('svg'), m = svg.getScreenCTM().inverse();
   const P = (x, y) => { const q = svg.createSVGPoint(); q.x = x; q.y = y; return q.matrixTransform(m); };
-  const a = P(r.left, r.top), b = P(r.right, r.bottom);
+  // y is the first line's baseline, measured as on the HTML side (zero-size inline-block marker).
+  const k = document.createElement('span');
+  k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0';
+  p.insertBefore(k, p.firstChild); const kb = k.getBoundingClientRect().bottom; k.remove();
+  const a = P(r.left, kb), b = P(r.right, r.bottom), t = P(r.left, r.top);
   // Line breaks are <br> elements (Qt collapses raw newlines), which textContent drops.
   const text = [...p.childNodes].map(n => n.nodeName.toLowerCase() === 'br' ? '\n' : n.textContent).join('');
-  return {text, x: a.x, y: a.y, h: b.y - a.y};
+  return {text, x: a.x, y: a.y, h: b.y - t.y};
 }).filter(Boolean)"""
 
 
