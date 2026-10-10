@@ -122,6 +122,11 @@ begin {
     $NoteTextInsetTop  = 1
     $NoteTextColumnInset = 25
     $NoteFontFamily = 'Segoe UI'
+    # Aptos isn't assumed to be installed where the file is opened, so note text is written in
+    # Segoe UI. Under line-height normal a line's baseline sits one ascent below its top: Aptos
+    # 1923/2048 em, Segoe UI 2210/2048 em. Note text is raised by the difference (3.4px at
+    # 24px) so its baseline lands where Whiteboard's Aptos baseline does.
+    $NoteBaselineRaise = (2210 - 1923) / 2048
 
     # Whiteboard's newer note style (class "noteVisualUpdate" on .textBoxBackground, first seen
     # in CompareAndContrast2) has no border, and puts a 40px author title bar
@@ -1584,9 +1589,10 @@ begin {
                         $noteFont = Get-CssNumber $noteStyle 'font-size' 24
                         $noteWeight = Get-FontWeight $coreStyle 700
                         $noteUnderline = Test-Underline $coreStyle
-                        $noteTextX = $a.X + ($note.TextLeft * $a.ScaleX); $noteTextY = $a.Y + ($note.TextTop * $a.ScaleY)
+                        $noteRaise = $noteFont * $NoteBaselineRaise
+                        $noteTextX = $a.X + ($note.TextLeft * $a.ScaleX); $noteTextY = $a.Y + (($note.TextTop - $noteRaise) * $a.ScaleY)
                         $noteTextW = ($cssW - $NoteTextColumnInset) * $a.ScaleX
-                        Add-IwbText $graphics $text $noteTextX $noteTextY $noteTextW (($cssH - $note.Border - 12) * $a.ScaleY) `
+                        Add-IwbText $graphics $text $noteTextX $noteTextY $noteTextW (($cssH - $note.Border - 12 + $noteRaise) * $a.ScaleY) `
                             ($noteFont * $a.ScaleY) $color 'left' -Weight $noteWeight -Family $NoteFontFamily -Group $group -Underline $noteUnderline
                         if ($noteUnderline) {
                             if (Add-IwbUnderline $graphics $text $noteTextX $noteTextY $noteTextW ($noteFont * $a.ScaleY) $color 'left' `
