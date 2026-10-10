@@ -50,14 +50,20 @@ SCRIPT = "Convert-WhiteboardHtmlToIwb.ps1"
 
 # Pass/fail tolerances in board pixels.
 # image_content: mean colour difference (0-255) between the two images' 8 x 8 thumbnails.
-TOL = {"text": 5.0, "image": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5, "image_content": 12.0,
+TOL = {"text": 5.0, "image": 0.5, "note": 0.5, "shape": 1.5, "arrow": 0.5, "image_content": 3.0,
        "note_color": 3.0, "ink": 0.5, "ink_width": 0.1}
 # note_color: largest channel difference (0-255) at five points of each note; ink_width in board px.
 
 # An image's 8 x 8 thumbnail drawn on white, as 192 RGB values (JS function source).
+# Drawn at 256 x 256 first, then halved five times: each halving averages 2 x 2 pixels, so
+# the thumbnail is a true area average. A direct 8 x 8 drawImage samples only a few source
+# pixels, which made a 256 px PNG sticker look lighter at its edges than the 64 px SVG it
+# was rasterised from.
 THUMB = r"""async (src) => { const im = new Image(); im.src = src; await im.decode();
-  const c = document.createElement('canvas'); c.width = c.height = 8; const g = c.getContext('2d');
-  g.fillStyle = '#fff'; g.fillRect(0, 0, 8, 8); g.drawImage(im, 0, 0, 8, 8);
+  let n = 256; let c = document.createElement('canvas'); c.width = c.height = n; let g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, n, n); g.drawImage(im, 0, 0, n, n);
+  while (n > 8) { n /= 2; const h = document.createElement('canvas'); h.width = h.height = n;
+    const hg = h.getContext('2d'); hg.imageSmoothingQuality = 'high'; hg.drawImage(c, 0, 0, n, n); c = h; g = hg; }
   return [...g.getImageData(0, 0, 8, 8).data].filter((v, i) => i % 4 !== 3); }"""
 
 
@@ -113,10 +119,45 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path, fill: str) -
 
 # ----------------------------------------------------------------------------------------
 # Whiteboard side: measure the export in the browser
+# A text element's first-line baseline in screen y, as an unrounded renderer would place it
+# (JS function source). Text y is compared there on both sides, not at the Range box top: that
+# is the content-area top, which includes CSS half-leading that Chromium rounds to whole px.
+# Chromium also rounds the ascent to whole px at the font size it lays out, and Whiteboard lays
+# out at 34 px and scales while the stand-in lays out at the final size, so even the drawn
+# baselines differ by up to 0.5 px x scale (2.1 px on KWL's 187 px letters). So this takes the
+# line top (a zero-size vertical-align:top marker) plus the drawn top-to-baseline distance
+# (a zero-size baseline marker), rescaled by the unrounded distance over Chromium's rounded one,
+# both read from unscaled probes of the same font (the unrounded one at 1000 px). A probe needs
+# text: in quirks mode (no doctype) a line of only empty inline-blocks gets no strut.
+# Returns screen [x, y]: the baseline across the line, the Range rect `rect` along it, so a
+# label rotated by 90 degrees is measured across its line in x.
+BASELINE = r"""(el, rect) => {
+  const cs = getComputedStyle(el), F = parseFloat(cs.fontSize);
+  const lh = cs.lineHeight === 'normal' ? 'normal' : String(parseFloat(cs.lineHeight) / F);
+  const mark = va => { const k = document.createElement('span');
+    k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0;vertical-align:' + va; return k; };
+  // Word joiners keep both markers on the first glyph's line: an inline-block is a break
+  // opportunity, and a glyph wider than its column (KWL's "W") would wrap away from them.
+  const span = host => { const t = mark('top'), b = mark('baseline');
+    const j = [0, 1].map(() => document.createTextNode('\u2060'));
+    host.insertBefore(j[1], host.firstChild); host.insertBefore(b, j[1]); host.insertBefore(j[0], b); host.insertBefore(t, j[0]);
+    const p = t.getBoundingClientRect(), q = b.getBoundingClientRect();
+    [t, b, ...j].forEach(n => n.remove()); return [p.left, p.top, q.left, q.bottom]; };
+  const probe = size => { const d = document.createElement('div');
+    d.style.cssText = 'position:absolute;left:0;top:0;margin:0;padding:0;border:0;white-space:nowrap;font-family:'
+      + cs.fontFamily + ';font-weight:' + cs.fontWeight + ';font-style:' + cs.fontStyle + ';font-size:' + size + 'px;line-height:' + lh;
+    d.textContent = 'x'; document.body.append(d); const s = span(d); d.remove(); return s[3] - s[1]; };
+  const [tx, ty, bx, by] = span(el), drawn = probe(F), k = drawn > 0 ? probe(1000) / 1000 * F / drawn : 1;
+  const x = tx + (bx - tx) * k, y = ty + (by - ty) * k;
+  return Math.abs(by - ty) >= Math.abs(bx - tx) ? [rect.left, y] : [x, rect.top];
+}"""
+
+
 # ----------------------------------------------------------------------------------------
 JS_HTML = (r"""async () => {
   const cal = [], texts = [], images = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [];
   const thumb = THUMB;
+  const baseline = BASELINE;
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   for (const a of document.querySelectorAll('div.anchor[data-whiteboard-type]')) {
     const st = a.getAttribute('style') || '', r = a.getBoundingClientRect();
@@ -128,8 +169,8 @@ JS_HTML = (r"""async () => {
     if (t.trim()) {
       const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
       rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
-      const b = rg.getBoundingClientRect();
-      texts.push({type, text: t.replace(/\r\n?/g, '\n'), x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height});
+      const b = rg.getBoundingClientRect(), [x, y] = baseline(spans[0], b);
+      texts.push({type, text: t.replace(/\r\n?/g, '\n'), x: x + scrollX, y: y + scrollY, w: b.width, h: b.height});
     }
     if (type === 'ReactionStickers' || type === 'Image' || type === 'AzureImage') {
       const im = a.querySelector('img');
@@ -170,7 +211,7 @@ JS_HTML = (r"""async () => {
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
   return {cal, texts, images, shapes, arrows, notes, noteStyles, inks, bbox};
-}""").replace("THUMB", THUMB, 1)
+}""").replace("THUMB", THUMB, 1).replace("BASELINE", BASELINE, 1)
 
 
 def linfit(xs, ys):
@@ -309,8 +350,14 @@ def textarea_lines(el) -> list[str]:
 CSS_WEIGHT = {"light": "300", "demibold": "600", "black": "900"}
 
 
-def browser_svg(z: zipfile.ZipFile, page, size) -> str:
-    """The page as plain SVG: images inlined, each textarea as a wrapped HTML box."""
+def browser_svg(z: zipfile.ZipFile, page, size, scale: float) -> str:
+    """The page as plain SVG: images inlined, each textarea as a wrapped HTML box.
+
+    Textareas are laid out at board scale (size / scale, then drawn through scale(scale)), as a
+    viewer zoomed to the board would lay them out. At page scale the fonts can be 3-4 px, and
+    Chromium rounds a font's ascent to whole px, so the measured baseline would carry up to
+    0.5 page px = 0.5 / scale board px (5 px at scale 0.1) of the stand-in renderer's rounding.
+    """
     w, h = size
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w:g}" height="{h:g}" viewBox="0 0 {w:g} {h:g}">',
            f'<rect width="{w:g}" height="{h:g}" fill="#fff"/>']
@@ -327,13 +374,17 @@ def browser_svg(z: zipfile.ZipFile, page, size) -> str:
             out.append(f'<image {attrs(el)} href="data:image/{mime};base64,{data}" preserveAspectRatio="none"/>')
         elif tag == "textarea":
             align = {"center": "center", "end": "right"}.get(el.get("text-align"), "left")
-            style = (f"font-family:'{el.get('font-family')}';font-size:{el.get('font-size')};font-weight:{CSS_WEIGHT.get(el.get('font-weight'), el.get('font-weight'))};"
+            fs = re.fullmatch(r"([\d.]+)(\D*)", el.get("font-size"))
+            style = (f"font-family:'{el.get('font-family')}';font-size:{float(fs[1]) / scale:g}{fs[2]};font-weight:{CSS_WEIGHT.get(el.get('font-weight'), el.get('font-weight'))};"
                      f"color:{el.get('fill')};text-align:{align};white-space:pre-wrap;overflow-wrap:break-word;"
                      "line-height:normal;margin:0;width:100%;overflow:visible")
             body = "<br/>".join(htmllib.escape(line) for line in textarea_lines(el))
-            fo = attrs(el, skip=("font-family", "font-size", "font-weight", "fill", "text-align"))
-            out.append(f'<foreignObject {fo} overflow="visible"><div xmlns="http://www.w3.org/1999/xhtml" '
-                       f'class="ta" style="{style}">{body}</div></foreignObject>')
+            fo = attrs(el, skip=("font-family", "font-size", "font-weight", "fill", "text-align",
+                                 "x", "y", "width", "height", "transform"))
+            g = f"{el.get('transform', '')} translate({el.get('x', '0')},{el.get('y', '0')}) scale({scale!r})".strip()
+            out.append(f'<g transform="{g}"><foreignObject {fo} width="{float(el.get("width")) / scale:g}" '
+                       f'height="{float(el.get("height")) / scale:g}" overflow="visible"><div xmlns="http://www.w3.org/1999/xhtml" '
+                       f'class="ta" style="{style}">{body}</div></foreignObject></g>')
     out.append("</svg>")
     return "".join(out)
 
@@ -343,10 +394,10 @@ JS_SVG = r"""() => [...document.querySelectorAll('div.ta')].map(div => {
   const rg = document.createRange(); rg.selectNodeContents(div);
   const r = rg.getBoundingClientRect(), svg = document.querySelector('svg'), m = svg.getScreenCTM().inverse();
   const P = (x, y) => { const q = svg.createSVGPoint(); q.x = x; q.y = y; return q.matrixTransform(m); };
-  const a = P(r.left, r.top);
+  const a = P(...(BASELINE)(div, r));
   const text = [...div.childNodes].map(n => n.nodeName.toLowerCase() === 'br' ? '\n' : n.textContent).join('');
   return {text, x: a.x, y: a.y};
-}).filter(Boolean)"""
+}).filter(Boolean)""".replace("BASELINE", BASELINE, 1)
 
 
 def pts_of(el):
@@ -360,7 +411,7 @@ def measure_iwb(page_, iwb: Path, shot: Path) -> dict:
     s, ox, oy = mapping
     B = lambda x, y: ((x - ox) / s, (y - oy) / s)
     page_.set_viewport_size({"width": int(size[0]), "height": int(size[1])})
-    page_.set_content("<html><body style='margin:0;background:#fff'>" + browser_svg(z, page, size) + "</body></html>")
+    page_.set_content("<html><body style='margin:0;background:#fff'>" + browser_svg(z, page, size, s) + "</body></html>")
     page_.wait_for_timeout(500)
     page_.screenshot(path=str(shot), full_page=True)
     texts = [dict(t, bx=B(t["x"], t["y"])[0], by=B(t["x"], t["y"])[1]) for t in page_.evaluate(JS_SVG)]
