@@ -93,6 +93,14 @@ begin {
     $PlainTextInsetRight = 16
     $PlainTextInsetTop   = 16
 
+    # OpenBoard's text item (UBGraphicsTextItem) keeps QTextDocument's default documentMargin of
+    # 4px: Qt lays the text out 4px in from the item's left and top, and the line width is the
+    # item width minus 2 x 4. Measured in the installed OpenBoard (Qt 6): glyphs 4.2-4.4px right
+    # of and below a margin-0 rendering, and a 230px item wraps a 227.8px line that a 240px one
+    # fits. So each text item is written 4px up and left (along its own, possibly rotated, axes)
+    # and 2 x 4px wider and taller than the text column it holds.
+    $QtDocumentMargin = 4
+
     # ".stickyNote { border-width: 1px }" sits outside the note's CSS width/height, and the
     # note's background fills that border too: a 304 x 304 note shows as 306 x 306.
     $NoteBorder = 1
@@ -1130,8 +1138,10 @@ begin {
         foreach ($g in $Graphics) {
             switch ($g.Kind) {
                 'Text' {
-                    # All four corners, so a rotated text box is bounded correctly too.
-                    foreach ($uv in @(@(0, 0), @($g.Width, 0), @(0, $g.Height), @($g.Width, $g.Height))) {
+                    # All four corners, so a rotated text box is bounded correctly too, out to
+                    # the item's edge (Qt's document margin around the text column).
+                    $m = $QtDocumentMargin; $u1 = $g.Width + $m; $v1 = $g.Height + $m
+                    foreach ($uv in @(@(-$m, -$m), @($u1, -$m), @(-$m, $v1), @($u1, $v1))) {
                         $px = $g.X + ($g.M11 * $uv[0]) + ($g.M21 * $uv[1])
                         $py = $g.Y + ($g.M12 * $uv[0]) + ($g.M22 * $uv[1])
                         $minX = [Math]::Min($minX, $px); $minY = [Math]::Min($minY, $py)
@@ -1198,8 +1208,12 @@ begin {
 
             switch ($g.Kind) {
                 'Text' {
-                    $sx = ($g.X - $centerX).ToString($ci); $sy = ($g.Y - $centerY).ToString($ci)
-                    $w = $g.Width.ToString($ci); $h = $g.Height.ToString($ci); $fs = $g.FontSize.ToString($ci)
+                    # Step back by Qt's document margin along the item's own axes, and widen it.
+                    $mx = $QtDocumentMargin * ($g.M11 + $g.M21); $my = $QtDocumentMargin * ($g.M12 + $g.M22)
+                    $sx = ($g.X - $mx - $centerX).ToString($ci); $sy = ($g.Y - $my - $centerY).ToString($ci)
+                    $w = ($g.Width + 2 * $QtDocumentMargin).ToString($ci)
+                    $h = ($g.Height + 2 * $QtDocumentMargin).ToString($ci)
+                    $fs = $g.FontSize.ToString($ci)
                     # Qt rich text collapses raw newlines to spaces, so line breaks become <br />.
                     $safe = (ConvertTo-XmlText $g.Text).Replace("`n", '<br />')
                     $decoration = if ($g.Underline) { ' text-decoration:underline;' } else { '' }
