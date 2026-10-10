@@ -102,6 +102,10 @@ begin {
     # run summary.
     $DefaultNoteFill = '#fee15a'
 
+    # Caches for Get-InstalledFontNames and Get-FontLineMetrics.
+    $script:InstalledFontNames = $null
+    $script:FontLineMetrics = @{}
+
     # Excalidraw draws each text element's "text" exactly as stored, one line per newline:
     # it never re-wraps a free-standing text on load, and it clips whatever overflows the
     # element's width. Whiteboard wraps to the column instead, so the converter breaks the
@@ -328,17 +332,49 @@ begin {
         }
     }
 
+    function Get-TextRuns {
+        # The text of an anchor as runs of uniformly styled text. Draft.js writes each paragraph
+        # as a <div data-block="true"> (an empty one holds only <br data-text="true">), and each
+        # run as <span data-offset-key style="..."><span data-text="true">text</span></span>,
+        # where the outer style carries per-run bold, italic and underline. Paragraphs are
+        # joined by a "`n" run; they used to be run together with no break. Weight is $null
+        # when the run has no weight of its own.
+        param([string]$Block)
+        $opts = [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Singleline
+        $paragraphs = @([regex]::Matches($Block, '<div\b[^>]*\bdata-block="true"[^>]*>(.*?)(?=<div\b[^>]*\bdata-block="true"|$)', $opts) |
+            ForEach-Object { $_.Groups[1].Value })
+        if ($paragraphs.Count -eq 0) { $paragraphs = @($Block) }
+        $runs = New-Object Collections.Generic.List[object]
+        for ($p = 0; $p -lt $paragraphs.Count; $p++) {
+            if ($p -gt 0) { [void]$runs.Add([pscustomobject]@{ Text = "`n"; Weight = $null; Italic = $false; Underline = $false; Strike = $false }) }
+            foreach ($m in [regex]::Matches($paragraphs[$p], '(?:<span\b([^>]*)>\s*)?<span\s+data-text="true"[^>]*>(.*?)</span>', $opts)) {
+                # Whiteboard stores soft line breaks inside a span as a bare CR or CRLF (the
+                # export keeps them raw); a browser reads both as a newline, so normalise them.
+                $text = [Net.WebUtility]::HtmlDecode(($m.Groups[2].Value -replace '<[^>]+>', '')) -replace "`r`n?", "`n"
+                $style = [Net.WebUtility]::HtmlDecode([string](Get-FirstMatch $m.Groups[1].Value '\bstyle="([^"]*)"'))
+                $weight = $null
+                if (Get-StyleValue $style 'font-weight') { $weight = Get-FontWeight $style 400 }
+                $decoration = "$(Get-StyleValue $style 'text-decoration')"
+                [void]$runs.Add([pscustomobject]@{
+                    Text = $text; Weight = $weight
+                    Italic = ("$(Get-StyleValue $style 'font-style')" -match '\b(italic|oblique)\b')
+                    Underline = ($decoration -match '\bunderline\b'); Strike = ($decoration -match '\bline-through\b')
+                })
+            }
+        }
+        return ,($runs.ToArray())
+    }
+
+    function Test-StyledRuns {
+        # True when any run carries its own bold, italic, underline or strikethrough.
+        param([object[]]$Runs)
+        foreach ($r in $Runs) { if ($null -ne $r.Weight -or $r.Italic -or $r.Underline -or $r.Strike) { return $true } }
+        return $false
+    }
+
     function Get-HtmlText {
         param([string]$Block)
-        $matches = [regex]::Matches($Block, '<span\s+data-text="true"[^>]*>(.*?)</span>',
-            [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-            [Text.RegularExpressions.RegexOptions]::Singleline)
-        $values = foreach ($m in $matches) {
-            [Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<[^>]+>', ''))
-        }
-        # Whiteboard stores soft line breaks inside a span as a bare CR or CRLF (the export
-        # keeps them raw); a browser reads both as a newline, so normalise them to LF here.
-        return (($values -join '') -replace "`r`n?", "`n")
+        return -join @((Get-TextRuns $Block) | ForEach-Object { $_.Text })
     }
 
     function Get-Transform {
@@ -585,16 +621,105 @@ begin {
         [void]$Elements.Add([pscustomobject]$e)
     }
 
+    function Get-InstalledFontNames {
+        # Names of the font families installed here (empty where System.Drawing is missing).
+        if ($null -eq $script:InstalledFontNames) {
+            $set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            try {
+                Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+                foreach ($f in (New-Object Drawing.Text.InstalledFontCollection).Families) { [void]$set.Add($f.Name) }
+            } catch { }
+            $script:InstalledFontNames = $set
+        }
+        return ,$script:InstalledFontNames
+    }
+
     function Get-FontFamily {
-        # The first family of an inline CSS font-family list. Older exports' plain text is
-        # "sans-serif, "Segoe UI"", and the generic sans-serif renders as Arial; newer exports
-        # (CompareAndContrast2) name "Segoe UI" itself, which is wider -- drawing it in Arial
-        # moved centred labels up to 21px.
+        # The face for an inline CSS font-family list: the first installed family, with
+        # Whiteboard's web-font aliases mapped to the installed fonts' names ("AptosSerif" is
+        # "Aptos Serif", "InkFreeFont" is "Ink Free") and generic families to Windows' faces.
+        # Older exports' plain text is "sans-serif, "Segoe UI"", and the generic sans-serif
+        # renders as Arial; newer exports (CompareAndContrast2) name "Segoe UI" itself, which is
+        # wider -- drawing it in Arial moved centred labels up to 21px. Where the installed
+        # fonts can't be listed, the first family is used.
         param([string]$Style, [string]$Default = 'Arial')
         $v = "$(Get-StyleValue ([Net.WebUtility]::HtmlDecode($Style)) 'font-family')"
-        $first = ($v -split ',')[0].Trim().Trim([char[]]@([char]34, [char]39)).Trim()
-        if (-not $first -or $first -eq 'sans-serif') { return $Default }
-        return $first
+        $aliases = @{ 'AptosSerif' = 'Aptos Serif'; 'AptosDisplay' = 'Aptos Display'; 'AptosMono' = 'Aptos Mono'
+                      'AptosNarrow' = 'Aptos Narrow'; 'InkFreeFont' = 'Ink Free'; 'sans-serif' = $Default
+                      'serif' = 'Times New Roman'; 'monospace' = 'Courier New' }
+        $names = @(($v -split ',') | ForEach-Object { $_.Trim().Trim([char[]]@([char]34, [char]39)).Trim() } | Where-Object { $_ } |
+            ForEach-Object { if ($aliases.ContainsKey($_)) { $aliases[$_] } else { $_ } })
+        if ($names.Count -eq 0) { return $Default }
+        $installed = Get-InstalledFontNames
+        foreach ($n in $names) { if ($installed.Contains($n)) { return $n } }
+        return $names[0]
+    }
+
+    function Get-LineHeight {
+        # An inline CSS line-height as a multiple of the font size; 0 for "normal" or none.
+        param([string]$Style, [double]$FontSize)
+        $v = "$(Get-StyleValue $Style 'line-height')".Trim()
+        if ($v -match '^([0-9.]+)%$') { return (Get-Number $Matches[1] 0) / 100.0 }
+        if ($v -match '^([0-9.]+)px$' -and $FontSize -gt 0) { return (Get-Number $Matches[1] 0) / $FontSize }
+        if ($v -match '^[0-9.]+$') { return Get-Number $v 0 }
+        return 0.0
+    }
+
+    function Get-LineHeightAdjustment {
+        # The line height to give a text's Excalidraw element, and how far to move the element
+        # down (in font sizes), so its first baseline and line spacing match Whiteboard's.
+        # Whiteboard lays the text out in its own face at its CSS line-height L (or the face's
+        # normal line height N): the first baseline is (L - ascent - descent) / 2 + ascent below
+        # the line top. The placement assumes 1854/2048 (see $TextBaselineShift), and a line
+        # height of L instead of 1.15 moves Excalidraw's own first baseline down by (L - 1.15) / 2.
+        # Arial's normal line includes a 67/2048 line gap, so its baseline is 1887.5/2048 (2.9px
+        # low on KWL's 187px letters); Segoe UI's is 1.08 em (8px at 48px), Segoe Print at 140%
+        # 1.08 em. $null when the face's metrics can't be read (the placement then assumes Arial).
+        param([double]$LineHeight, [string]$Family, [int]$Weight)
+        $m = Get-FontLineMetrics $Family $Weight
+        if ($null -eq $m) { return $null }
+        $used = if ($LineHeight -gt 0) { $LineHeight } else { $m.Normal }
+        return [pscustomobject]@{
+            LineHeight = $used
+            Shift = ((($used - $m.Content) / 2) + $m.Ascent) - (1854 / 2048) - (($used - $TextLineHeight) / 2)
+        }
+    }
+
+    function Get-FontLineMetrics {
+        # A face's line metrics as multiples of the font size: Normal is the browser's
+        # "line-height: normal" (ascent + descent + line gap) and Content the ascent + descent,
+        # which Qt's proportional line height is a percentage of. $null if the face isn't
+        # installed or System.Drawing is missing.
+        param([string]$Family, [int]$Weight = 400)
+        $key = "$Family|$([int]($Weight -ge 600))"
+        if (-not $script:FontLineMetrics.ContainsKey($key)) {
+            $metrics = $null
+            if ((Get-InstalledFontNames).Contains($Family)) {
+                try {
+                    $ff = New-Object Drawing.FontFamily $Family
+                    $style = if ($Weight -ge 600 -and $ff.IsStyleAvailable([Drawing.FontStyle]::Bold)) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular }
+                    $em = [double]$ff.GetEmHeight($style)
+                    $metrics = [pscustomobject]@{
+                        Normal = $ff.GetLineSpacing($style) / $em
+                        Content = ($ff.GetCellAscent($style) + $ff.GetCellDescent($style)) / $em
+                        Ascent = $ff.GetCellAscent($style) / $em
+                    }
+                    $ff.Dispose()
+                } catch { $metrics = $null }
+            }
+            $script:FontLineMetrics[$key] = $metrics
+        }
+        return $script:FontLineMetrics[$key]
+    }
+
+    function Get-FontWeight {
+        # CSS font-weight from an inline style: numbers as-is, normal/bold as 400/700.
+        param([string]$Style, [int]$Default = 400)
+        $v = "$(Get-StyleValue $Style 'font-weight')".Trim()
+        if ($v -match '^\d+$') { return [int]$v }
+        if ($v -eq 'bold') { return 700 }
+        if ($v -eq 'normal') { return 400 }
+        return $Default
     }
 
     function Test-Underline {
@@ -703,7 +828,7 @@ begin {
         # connector came out as a straight line to its first corner. Exact is $false when the
         # path holds something not traced here: an arc (A, drawn as a straight segment to its
         # end point), a second subpath (joined on), or a malformed command (the rest is
-        # dropped). Returns $null for fewer than two points.
+        # dropped). A zero-length line has a single point; $null means no path at all.
         param([string]$Block)
         $d = Get-FirstMatch $Block '<path\s+d="([^"]+)"'
         if (-not $d) { return $null }
@@ -791,7 +916,7 @@ begin {
             }
             [void]$clean.Add($p)
         }
-        if ($clean.Count -lt 2) { return $null }
+        if ($clean.Count -eq 0) { return $null }
         return [pscustomobject]@{ Points = $clean.ToArray(); Exact = $exact }
     }
 
@@ -1094,6 +1219,10 @@ begin {
         $noteColors = Get-NoteColorTable $html
         $noteColorMissing = [Collections.Generic.List[string]]::new()
         $inkStrokeCount = 0; $inkApproximated = 0; $fontSubstituted = 0
+        $connectorEmptyCount = 0; $styledRunTexts = 0
+        # Shape text has no inline font-family: the stylesheet's ".textbox.shapeText" uses
+        # var(--fontFamilySimple), "Aptos","Segoe UI",... in every export seen.
+        $simpleFamily = Get-FontFamily ('font-family: ' + [string](Get-FirstMatch $html '--fontFamilySimple\s*:\s*([^;}]+)')) 'Arial'
 
         foreach ($block in $blocks) {
             $a = Get-AnchorInfo $block
@@ -1179,30 +1308,40 @@ begin {
 
                     # Whiteboard stores labels such as the blue-box "test" text
                     # inside the Shape block. V1 converted only the outline.
-                    $shapeText = Get-HtmlText $block
+                    $shapeRuns = Get-TextRuns $block
+                    $shapeText = -join @($shapeRuns | ForEach-Object { $_.Text })
                     if (-not [string]::IsNullOrEmpty($shapeText)) {
+                        # Excalidraw text has one style: per-run bold, italic and underline are lost.
+                        if (Test-StyledRuns $shapeRuns) { $styledRunTexts++ }
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                         $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
-                        if ((Get-FontFamily $shapeCoreStyle) -ne 'Arial') { $fontSubstituted++ }
+                        $shapeFamily = Get-FontFamily $shapeCoreStyle $simpleFamily
+                        if ($shapeFamily -ne 'Arial') { $fontSubstituted++ }
                         $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1.0, $lw - 26))
                         $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1.0, $lh - 26))
                         $textHeight = [Math]::Min($innerHeight, (Get-TextBlockHeight $shapeText $innerWidth $fontLocal))
-                        $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2)) $innerWidth $textHeight
+                        $adj = Get-LineHeightAdjustment (Get-LineHeight $shapeCoreStyle $fontLocal) $shapeFamily (Get-FontWeight $shapeCoreStyle 700)
+                        $shift = if ($adj) { $adj.Shift * $fontLocal } else { 0.0 }
+                        $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2) + $shift) $innerWidth $textHeight
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
                         $underline = Test-Underline $shapeCoreStyle
                         if ($underline) { $underlinedCount++ }
-                        Add-TextElement $elements $shapeText $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $textColor $textAlign $p.Angle -Underline $underline
+                        Add-TextElement $elements $shapeText $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $textColor $textAlign $p.Angle -Underline $underline `
+                            -LineHeight $(if ($adj) { $adj.LineHeight } else { 0 })
                     }
                 }
                 'PlainText' {
-                    $text = Get-HtmlText $block
+                    $runs = Get-TextRuns $block
+                    $text = -join @($runs | ForEach-Object { $_.Text })
+                    if ($text.Trim() -and (Test-StyledRuns $runs)) { $styledRunTexts++ }
                     $textBoxStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+plainText\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                     $outerStyle = Get-FirstMatch $block '<div\s+style="([^"]*width:[^"]*display:\s*flex[^"]*)"'
                     $fontLocal = Get-CssNumber $textBoxStyle 'font-size' 20
-                    if ($text.Trim() -and (Get-FontFamily $coreStyle) -ne 'Arial') { $fontSubstituted++ }
+                    $family = Get-FontFamily $coreStyle
+                    if ($text.Trim() -and $family -ne 'Arial') { $fontSubstituted++ }
                     # Whiteboard insets the text inside every plain-text box (see
                     # $PlainTextInsetLeft): the glyphs start at local (17, 16), and the column
                     # is the outer width minus both side insets. Placing the box at the anchor
@@ -1211,16 +1350,22 @@ begin {
                     if ($width -le 0) { $width = Get-CssNumber $textBoxStyle 'max-width' 0 }
                     if ($width -gt 0) { $width = [Math]::Max(1.0, $width - $PlainTextInsetLeft - $PlainTextInsetRight) }
                     else { $width = [Math]::Max(20.0, $text.Length * $fontLocal * 0.58) }
+                    $adj = Get-LineHeightAdjustment (Get-LineHeight $coreStyle $fontLocal) $family (Get-FontWeight $coreStyle 400)
                     $height = Get-TextBlockHeight $text $width $fontLocal
+                    $shift = 0.0
+                    if ($adj) { $height = $height / $TextLineHeight * $adj.LineHeight; $shift = $adj.Shift * $fontLocal }
                     $color = Convert-RgbaToHex (Get-StyleValue $coreStyle 'color') '#000000'
                     $align = if ($block -match 'DraftEditor-alignCenter') { 'center' } elseif ($block -match 'DraftEditor-alignRight') { 'right' } else { 'left' }
-                    $p = Get-BoxPlacement $a $PlainTextInsetLeft ($PlainTextInsetTop + ($TextBaselineShift * $fontLocal)) $width $height
+                    $p = Get-BoxPlacement $a $PlainTextInsetLeft ($PlainTextInsetTop + ($TextBaselineShift * $fontLocal) + $shift) $width $height
                     $underline = Test-Underline $coreStyle
                     if ($underline -and $text.Trim()) { $underlinedCount++ }
-                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $color $align $p.Angle -Underline $underline
+                    Add-TextElement $elements $text $p.X $p.Y $p.Width $p.Height ($fontLocal * $a.ScaleY) $color $align $p.Angle -Underline $underline `
+                        -LineHeight $(if ($adj) { $adj.LineHeight } else { 0 })
                 }
                 'Note' {
-                    $text = Get-HtmlText $block
+                    $noteRuns = Get-TextRuns $block
+                    $text = -join @($noteRuns | ForEach-Object { $_.Text })
+                    if ($text.Trim() -and (Test-StyledRuns $noteRuns)) { $styledRunTexts++ }
                     $noteStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+stickyNote\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                     $note = Get-NoteLayout $block $noteColors
@@ -1262,6 +1407,11 @@ begin {
                     $h = Get-Number (Get-FirstMatch $svgTag '\bheight="([0-9.]+)"') 10
                     $gTag = Get-FirstMatch $block '(<g\b[^>]*>)'
                     $line = Get-ConnectorPoints $block
+                    if ($line -and $line.Points.Count -lt 2) {
+                        # A zero-length line ("M11 11L11 11") draws nothing in Whiteboard.
+                        $connectorEmptyCount++
+                        break
+                    }
                     if ($line) {
                         $linePts = $line.Points
                         if (-not $line.Exact) { [void]$connectorApprox.Add("$($a.Type):$($a.Key)") }
@@ -1276,7 +1426,15 @@ begin {
                     # land where Whiteboard draws them. Excalidraw measures a linear element's
                     # points from its first point, which sits at (x, y); elbow and curved
                     # connectors keep every bend (curves flattened) as extra points.
-                    $boardPts = @($linePts | ForEach-Object { ,(Get-BoardPoint $a $_[0] $_[1]) })
+                    # Elbow connectors wrap their <svg> in <div style="position: relative; left: 0px;
+                    # top: -16px;">, which moves the whole drawing: -16px on most, -1220px on one
+                    # in RotatedTest1. Ignoring it put the line and arrowheads that far too low.
+                    # (Arrowhead tips are matched to the ends before the offset, in the same frame.)
+                    $offset = [regex]::Match($block, '<div\s+style="\s*position:\s*relative;\s*left:\s*(-?[0-9.]+)px;\s*top:\s*(-?[0-9.]+)px;?\s*">\s*<svg\b',
+                        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                    $offX = 0.0; $offY = 0.0
+                    if ($offset.Success) { $offX = Get-Number $offset.Groups[1].Value 0; $offY = Get-Number $offset.Groups[2].Value 0 }
+                    $boardPts = @($linePts | ForEach-Object { ,(Get-BoardPoint $a ($_[0] + $offX) ($_[1] + $offY)) })
                     $p1 = $boardPts[0]
                     $minX = 0.0; $maxX = 0.0; $minY = 0.0; $maxY = 0.0
                     $pointList = New-Object Collections.ArrayList
@@ -1349,9 +1507,9 @@ begin {
                         $stickerFallbackCount++
                     }
                 }
-                {$_ -in 'Image', 'AzureImage'} {
-                    # Newer Whiteboard exports tag images as "AzureImage" rather
-                    # than "Image", but use the same imageComponent/img markup.
+                {$_ -in 'Image', 'AzureImage', 'FluidImage'} {
+                    # Newer Whiteboard exports tag images as "AzureImage" (and, in RotatedTest1,
+                    # "FluidImage") rather than "Image", but use the same imageComponent/img markup.
                     $src = Get-FirstMatch $block '<img\b[^>]*\bsrc="([^"]+)"'
                     if (-not $src) { [void]$unsupported.Add("$($a.Type):$($a.Key) (missing image data)"); break }
                     $src = [Net.WebUtility]::HtmlDecode($src)
@@ -1437,6 +1595,7 @@ begin {
             MirrorIgnored=$mirrorIgnored.Count; MirrorIgnoredDetails=@($mirrorIgnored)
             NoteColorMissing=$noteColorMissing.Count; NoteColorMissingDetails=@($noteColorMissing)
             InkStrokes=$inkStrokeCount; InkApproximated=$inkApproximated; FontSubstituted=$fontSubstituted
+            ConnectorsEmpty=$connectorEmptyCount; StyledRunTexts=$styledRunTexts
         }
     }
 }
@@ -1476,6 +1635,9 @@ process {
         if ($result.ConnectorsBent -gt 0) {
             Write-Host ("  {0} elbow/curved connector(s) traced through every bend." -f $result.ConnectorsBent)
         }
+        if ($result.ConnectorsEmpty -gt 0) {
+            Write-Host ("  {0} zero-length connector(s) skipped (Whiteboard draws nothing for them)." -f $result.ConnectorsEmpty)
+        }
         if ($result.ConnectorsApproximated -gt 0) {
             Write-Warning ("{0} connector(s) had a line this script could not fully trace (an arc, a second subpath or no path); those parts were drawn straight: {1}" -f `
                 $result.ConnectorsApproximated, ($result.ConnectorsApproximatedDetails -join ', '))
@@ -1492,6 +1654,9 @@ process {
         }
         if ($result.FontSubstituted -gt 0) {
             Write-Warning ("{0} text(s) use a font other than Arial (e.g. Segoe UI) in Whiteboard; Excalidraw draws them in its Helvetica, so they are narrower and may wrap differently." -f $result.FontSubstituted)
+        }
+        if ($result.StyledRunTexts -gt 0) {
+            Write-Warning ("{0} text(s) are partly bold, italic or underlined; Excalidraw text has one style, so they are drawn plain." -f $result.StyledRunTexts)
         }
         if ($result.MirrorIgnored -gt 0) {            Write-Warning ("{0} mirrored object(s) were drawn unmirrored (Excalidraw can't mirror): {1}" -f `
                 $result.MirrorIgnored, ($result.MirrorIgnoredDetails -join ', '))

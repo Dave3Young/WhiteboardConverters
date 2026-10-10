@@ -41,7 +41,7 @@ Open the file at [excalidraw.com](https://excalidraw.com/) or in the Excalidraw 
 ## What gets converted
 | Whiteboard object | In Excalidraw |
 | --- | --- |
-| Plain text | Editable text, wrapped into the same lines as in Whiteboard and re-wrapped by Excalidraw when you edit it. |
+| Plain text | Editable text, wrapped into the same lines as in Whiteboard and re-wrapped by Excalidraw when you edit it. Each text sits on Whiteboard's baseline and keeps its line spacing, measured in the face Whiteboard uses. |
 | Sticky note | A filled rectangle in the note's colour (solid, or banded along its gradient) with its text. |
 | Shape | Rectangles, ovals and diamonds become native Excalidraw shapes, sized to Whiteboard's exact outline. Any other shape becomes a closed line. Text inside a shape becomes a separate text element. |
 | Connector | A native Excalidraw arrow or line, keeping its arrowheads and dashes. Elbow and curved connectors keep every bend as a point. |
@@ -57,11 +57,15 @@ The run summary reports every item below when it occurs.
 - **Stickers without artwork** are drawn as a fallback symbol.
 - **Untraceable shapes:** a shape whose outline can't be traced is built from its label.
 - **Font:** text uses Excalidraw's Helvetica, and bold is dropped. Text set in another face
-  in Whiteboard (newer exports use Segoe UI) is narrower, and is counted.
+  in Whiteboard (newer exports use Segoe UI or Aptos) is narrower, and is counted. Its
+  baseline and line spacing still follow Whiteboard's face.
+- **Partly styled text:** Excalidraw text has one style, so a text with bold, italic or
+  underlined parts is drawn plain, and counted.
 - **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
   effect pen is approximated.
-- **Elbow and curved connectors** are traced through every bend (curves as many short steps),
-  but no sample has one, so they are tested only on hand-edited paths. Arcs are drawn straight.
+- **Curved connectors** are traced through every bend (as many short steps), but no sample
+  has one, so they are tested only on hand-edited paths. Arcs are drawn straight. Elbow
+  connectors are tested (RotatedTest1).
 - **Underline:** Excalidraw text can't be underlined, so a line is drawn under each line of
   underlined text and grouped with it. If you edit the text, the line doesn't follow the new
   wording.
@@ -73,10 +77,11 @@ The run summary reports every item below when it occurs.
 .\tests\Invoke-VisualTests.ps1    # geometry vs. Whiteboard's real layout
 ```
 
-- **Samples:** `samples\` holds 60 real Whiteboard exports.
+- **Samples:** `samples\` holds 61 real Whiteboard exports.
 - **Visual tests:** they measure the original board in headless Chromium and compare every
   text, note, shape, sticker, image, connector, arrowhead and ink stroke, and every note's
-  colour, with the converted scene. They
+  colour, with the converted scene. Text is compared at its first baseline, and connectors
+  along their whole path. They
   also fail any line of text that Excalidraw would clip. The report is written to
   `tests\out\visual\report.html`, and shows each board next to both converted scenes, drawn
   by Excalidraw's own exporter. Setup installs that exporter with npm, so it needs Node.js.

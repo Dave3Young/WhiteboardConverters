@@ -139,6 +139,10 @@ begin {
     # run summary.
     $DefaultNoteFill = '#fee15a'
 
+    # Caches for Get-InstalledFontNames and Get-FontLineMetrics.
+    $script:InstalledFontNames = $null
+    $script:FontLineMetrics = @{}
+
     # Plain text and shape labels are "sans-serif" in the export, which renders as Arial.
     $TextFontFamily = 'Arial'
 
@@ -209,17 +213,49 @@ begin {
         return Get-FirstMatch $Style ('(?:^|;)\s*' + [regex]::Escape($Name) + '\s*:\s*([^;]+)')
     }
 
+    function Get-TextRuns {
+        # The text of an anchor as runs of uniformly styled text. Draft.js writes each paragraph
+        # as a <div data-block="true"> (an empty one holds only <br data-text="true">), and each
+        # run as <span data-offset-key style="..."><span data-text="true">text</span></span>,
+        # where the outer style carries per-run bold, italic and underline. Paragraphs are
+        # joined by a "`n" run; they used to be run together with no break. Weight is $null
+        # when the run has no weight of its own.
+        param([string]$Block)
+        $opts = [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::Singleline
+        $paragraphs = @([regex]::Matches($Block, '<div\b[^>]*\bdata-block="true"[^>]*>(.*?)(?=<div\b[^>]*\bdata-block="true"|$)', $opts) |
+            ForEach-Object { $_.Groups[1].Value })
+        if ($paragraphs.Count -eq 0) { $paragraphs = @($Block) }
+        $runs = New-Object Collections.Generic.List[object]
+        for ($p = 0; $p -lt $paragraphs.Count; $p++) {
+            if ($p -gt 0) { [void]$runs.Add([pscustomobject]@{ Text = "`n"; Weight = $null; Italic = $false; Underline = $false; Strike = $false }) }
+            foreach ($m in [regex]::Matches($paragraphs[$p], '(?:<span\b([^>]*)>\s*)?<span\s+data-text="true"[^>]*>(.*?)</span>', $opts)) {
+                # Whiteboard stores soft line breaks inside a span as a bare CR or CRLF (the
+                # export keeps them raw); a browser reads both as a newline, so normalise them.
+                $text = [Net.WebUtility]::HtmlDecode(($m.Groups[2].Value -replace '<[^>]+>', '')) -replace "`r`n?", "`n"
+                $style = [Net.WebUtility]::HtmlDecode([string](Get-FirstMatch $m.Groups[1].Value '\bstyle="([^"]*)"'))
+                $weight = $null
+                if (Get-StyleValue $style 'font-weight') { $weight = Get-FontWeight $style 400 }
+                $decoration = "$(Get-StyleValue $style 'text-decoration')"
+                [void]$runs.Add([pscustomobject]@{
+                    Text = $text; Weight = $weight
+                    Italic = ("$(Get-StyleValue $style 'font-style')" -match '\b(italic|oblique)\b')
+                    Underline = ($decoration -match '\bunderline\b'); Strike = ($decoration -match '\bline-through\b')
+                })
+            }
+        }
+        return ,($runs.ToArray())
+    }
+
+    function Test-StyledRuns {
+        # True when any run carries its own bold, italic, underline or strikethrough.
+        param([object[]]$Runs)
+        foreach ($r in $Runs) { if ($null -ne $r.Weight -or $r.Italic -or $r.Underline -or $r.Strike) { return $true } }
+        return $false
+    }
+
     function Get-HtmlText {
         param([string]$Block)
-        $matches = [regex]::Matches($Block, '<span\s+data-text="true"[^>]*>(.*?)</span>',
-            [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-            [Text.RegularExpressions.RegexOptions]::Singleline)
-        $values = foreach ($m in $matches) {
-            [Net.WebUtility]::HtmlDecode(($m.Groups[1].Value -replace '<[^>]+>', ''))
-        }
-        # Whiteboard stores soft line breaks inside a span as a bare CR or CRLF (the export
-        # keeps them raw); a browser reads both as a newline, so normalise them to LF here.
-        return (($values -join '') -replace "`r`n?", "`n")
+        return -join @((Get-TextRuns $Block) | ForEach-Object { $_.Text })
     }
 
     function Get-Transform {
@@ -558,7 +594,7 @@ begin {
         # connector came out as a straight line to its first corner. Exact is $false when the
         # path holds something not traced here: an arc (A, drawn as a straight segment to its
         # end point), a second subpath (joined on), or a malformed command (the rest is
-        # dropped). Returns $null for fewer than two points.
+        # dropped). A zero-length line has a single point; $null means no path at all.
         param([string]$Block)
         $d = Get-FirstMatch $Block '<path\s+d="([^"]+)"'
         if (-not $d) { return $null }
@@ -646,7 +682,7 @@ begin {
             }
             [void]$clean.Add($p)
         }
-        if ($clean.Count -lt 2) { return $null }
+        if ($clean.Count -eq 0) { return $null }
         return [pscustomobject]@{ Points = $clean.ToArray(); Exact = $exact }
     }
 
@@ -910,39 +946,118 @@ begin {
             # local y axis is (M21, M22), in SVG matrix order.
             [double]$M11 = 1, [double]$M12 = 0, [double]$M21 = 0, [double]$M22 = 1,
             [int]$Weight = 400, [string]$Family = $TextFontFamily, [string]$Group = $null,
-            [bool]$Underline = $false
+            [bool]$Underline = $false, [bool]$Italic = $false,
+            # CSS line-height as a multiple of the font size (Get-LineHeight); 0 = normal.
+            [double]$LineHeight = 0,
+            # Runs with their own styling (Get-TextRuns), or $null for uniformly styled text.
+            [object[]]$Runs = $null
         )
         if ([string]::IsNullOrEmpty($Text)) { return }
         $FontSize = Get-ScalarDouble $FontSize 20
         if ($Width -le 1) { $Width = [Math]::Max(1.0, [Math]::Min(4000.0, $Text.Length * $FontSize * 0.62)) }
         # A textarea shows only the lines that fit its height (SVG Tiny 1.2), and OpenBoard
         # squashes a text item whose content is taller than it, so err on the tall side.
-        $needed = ((Get-TextLineCount $Text $Width $FontSize) + 1) * $FontSize * 1.35
+        $lineFactor = [Math]::Max(1.35, $LineHeight)
+        $needed = ((Get-TextLineCount $Text $Width $FontSize) + 1) * $FontSize * $lineFactor
         $Height = [Math]::Max($Height, $needed)
+        # A set line height moves the first line by half the difference from the font's normal
+        # line height (CSS half-leading), so the box moves with it along its own y axis; later
+        # lines are spaced by line-increment. Segoe Print's normal line is 1.77 em, so at 140%
+        # the text was 5.8px low.
+        $lineIncrement = 0.0
+        $metrics = if ($LineHeight -gt 0) { Get-FontLineMetrics $Family $Weight } else { $null }
+        if ($null -ne $metrics) {
+            $shift = ($LineHeight - $metrics.Normal) * $FontSize / 2
+            $X += $M21 * $shift; $Y += $M22 * $shift
+            $lineIncrement = $LineHeight * $FontSize
+        }
         [void]$Graphics.Add([pscustomobject]@{
             Kind = 'Text'; X = $X; Y = $Y; Width = $Width; Height = $Height
             FontSize = $FontSize; Color = $Color; Align = $Align; Family = $Family; Weight = $Weight
             Text = $Text; M11 = $M11; M12 = $M12; M21 = $M21; M22 = $M22; Group = $Group
-            Underline = $Underline
+            Underline = $Underline; Italic = $Italic; LineIncrement = $lineIncrement; Runs = $Runs
         })
     }
 
+    function Get-InstalledFontNames {
+        # Names of the font families installed here (empty where System.Drawing is missing).
+        if ($null -eq $script:InstalledFontNames) {
+            $set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            try {
+                Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+                foreach ($f in (New-Object Drawing.Text.InstalledFontCollection).Families) { [void]$set.Add($f.Name) }
+            } catch { }
+            $script:InstalledFontNames = $set
+        }
+        return ,$script:InstalledFontNames
+    }
+
     function Get-FontFamily {
-        # The first family of an inline CSS font-family list. Older exports' plain text is
-        # "sans-serif, "Segoe UI"", and the generic sans-serif renders as Arial; newer exports
-        # (CompareAndContrast2) name "Segoe UI" itself, which is wider -- drawing it in Arial
-        # moved centred labels up to 21px.
+        # The face for an inline CSS font-family list: the first installed family, with
+        # Whiteboard's web-font aliases mapped to the installed fonts' names ("AptosSerif" is
+        # "Aptos Serif", "InkFreeFont" is "Ink Free") and generic families to Windows' faces.
+        # Older exports' plain text is "sans-serif, "Segoe UI"", and the generic sans-serif
+        # renders as Arial; newer exports (CompareAndContrast2) name "Segoe UI" itself, which is
+        # wider -- drawing it in Arial moved centred labels up to 21px. Where the installed
+        # fonts can't be listed, the first family is used.
         param([string]$Style, [string]$Default = 'Arial')
         $v = "$(Get-StyleValue ([Net.WebUtility]::HtmlDecode($Style)) 'font-family')"
-        $first = ($v -split ',')[0].Trim().Trim([char[]]@([char]34, [char]39)).Trim()
-        if (-not $first -or $first -eq 'sans-serif') { return $Default }
-        return $first
+        $aliases = @{ 'AptosSerif' = 'Aptos Serif'; 'AptosDisplay' = 'Aptos Display'; 'AptosMono' = 'Aptos Mono'
+                      'AptosNarrow' = 'Aptos Narrow'; 'InkFreeFont' = 'Ink Free'; 'sans-serif' = $Default
+                      'serif' = 'Times New Roman'; 'monospace' = 'Courier New' }
+        $names = @(($v -split ',') | ForEach-Object { $_.Trim().Trim([char[]]@([char]34, [char]39)).Trim() } | Where-Object { $_ } |
+            ForEach-Object { if ($aliases.ContainsKey($_)) { $aliases[$_] } else { $_ } })
+        if ($names.Count -eq 0) { return $Default }
+        $installed = Get-InstalledFontNames
+        foreach ($n in $names) { if ($installed.Contains($n)) { return $n } }
+        return $names[0]
+    }
+
+    function Get-LineHeight {
+        # An inline CSS line-height as a multiple of the font size; 0 for "normal" or none.
+        param([string]$Style, [double]$FontSize)
+        $v = "$(Get-StyleValue $Style 'line-height')".Trim()
+        if ($v -match '^([0-9.]+)%$') { return (Get-Number $Matches[1] 0) / 100.0 }
+        if ($v -match '^([0-9.]+)px$' -and $FontSize -gt 0) { return (Get-Number $Matches[1] 0) / $FontSize }
+        if ($v -match '^[0-9.]+$') { return Get-Number $v 0 }
+        return 0.0
+    }
+
+    function Get-FontLineMetrics {
+        # A face's line metrics as multiples of the font size: Normal is the browser's
+        # "line-height: normal" (ascent + descent + line gap) and Content the ascent + descent,
+        # which Qt's proportional line height is a percentage of. $null if the face isn't
+        # installed or System.Drawing is missing.
+        param([string]$Family, [int]$Weight = 400)
+        $key = "$Family|$([int]($Weight -ge 600))"
+        if (-not $script:FontLineMetrics.ContainsKey($key)) {
+            $metrics = $null
+            if ((Get-InstalledFontNames).Contains($Family)) {
+                try {
+                    $ff = New-Object Drawing.FontFamily $Family
+                    $style = if ($Weight -ge 600 -and $ff.IsStyleAvailable([Drawing.FontStyle]::Bold)) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular }
+                    $em = [double]$ff.GetEmHeight($style)
+                    $metrics = [pscustomobject]@{
+                        Normal = $ff.GetLineSpacing($style) / $em
+                        Content = ($ff.GetCellAscent($style) + $ff.GetCellDescent($style)) / $em
+                    }
+                    $ff.Dispose()
+                } catch { $metrics = $null }
+            }
+            $script:FontLineMetrics[$key] = $metrics
+        }
+        return $script:FontLineMetrics[$key]
     }
 
     function Test-Underline {
         # Whiteboard underlines a whole text box with text-decoration on its textBoxCore div.
         param([string]$Style)
         return "$(Get-StyleValue $Style 'text-decoration')" -match '\bunderline\b'
+    }
+
+    function Test-Italic {
+        param([string]$Style)
+        return "$(Get-StyleValue $Style 'font-style')" -match '\b(italic|oblique)\b'
     }
 
     function Add-IwbUnderline {
@@ -974,11 +1089,32 @@ begin {
         # Raster is a pending rasterisation (SVG sticker / WebP image) that replaces Bytes with
         # a PNG after all objects are read; $null when the file is already a CFF image format.
         param([Collections.Generic.List[object]]$Graphics, [double]$X, [double]$Y, [double]$Width, [double]$Height,
-              [byte[]]$Bytes, [string]$Extension, $Raster = $null, [string]$Group = $null)
+              [byte[]]$Bytes, [string]$Extension, $Raster = $null, [string]$Group = $null,
+              # Clockwise rotation in degrees about the top-left corner (X, Y).
+              [double]$Angle = 0)
         [void]$Graphics.Add([pscustomobject]@{
-            Kind = 'Image'; X = $X; Y = $Y; Width = $Width; Height = $Height
+            Kind = 'Image'; X = $X; Y = $Y; Width = $Width; Height = $Height; Angle = $Angle
             Bytes = $Bytes; Extension = $Extension; Raster = $Raster; Path = $null; Group = $Group
         })
+    }
+
+    function Get-ImagePlacement {
+        # Where an image or sticker of $LocalWidth x $LocalHeight (the anchor's own px) goes: its
+        # board-space top-left corner, mapped through the anchor's matrix, and the rotation about
+        # that corner. A mirrored matrix can't be written as IWB's translate/rotate, so it is
+        # placed unrotated at the right size (Rotated = $false).
+        param($Anchor, [double]$LocalWidth, [double]$LocalHeight)
+        $u = 0.0; $v = 0.0
+        if ($Anchor.IsCentered) { $u = -$LocalWidth / 2; $v = -$LocalHeight / 2 }
+        $mirrored = (($Anchor.MA * $Anchor.MD) - ($Anchor.MB * $Anchor.MC)) -lt 0
+        if (-not $Anchor.IsRotated -or $mirrored) {
+            return [pscustomobject]@{ X = $Anchor.X + ($u * $Anchor.ScaleX); Y = $Anchor.Y + ($v * $Anchor.ScaleY); Angle = 0.0; Rotated = $false }
+        }
+        $corner = ConvertTo-BoardPoints $Anchor @(,[double[]]@($u, $v))
+        return [pscustomobject]@{
+            X = $corner[0][0]; Y = $corner[0][1]; Rotated = $true
+            Angle = [Math]::Atan2($Anchor.MB, $Anchor.MA) * 180.0 / [Math]::PI
+        }
     }
 
     function Add-IwbShape {
@@ -1262,7 +1398,12 @@ begin {
                 'Rect' { ,@(@($g.X, $g.Y), @(($g.X + $g.W), ($g.Y + $g.H))) }
                 'Polygon' { ,$g.Points }
                 'Line' { ,@(@($g.X1, $g.Y1), @($g.X2, $g.Y2)) }
-                'Image' { ,@(@($g.X, $g.Y), @(($g.X + $g.Width), ($g.Y + $g.Height))) }
+                'Image' {
+                    $rad = $g.Angle * [Math]::PI / 180.0; $c = [Math]::Cos($rad); $sn = [Math]::Sin($rad)
+                    ,@(foreach ($uv in @(@(0, 0), @($g.Width, 0), @(0, $g.Height), @($g.Width, $g.Height))) {
+                        ,@(($g.X + ($c * $uv[0]) - ($sn * $uv[1])), ($g.Y + ($sn * $uv[0]) + ($c * $uv[1])))
+                    })
+                }
                 'Text' {
                     # All four corners, so a rotated text box is bounded correctly too.
                     ,@(foreach ($uv in @(@(0, 0), @($g.Width, 0), @(0, $g.Height), @($g.Width, $g.Height))) {
@@ -1365,14 +1506,40 @@ begin {
                         $position = ' x="{0}" y="{1}"' -f (& $px $g.X), (& $py $g.Y)
                     }
                     $decoration = if ($g.Underline) { ' text-decoration="underline"' } else { '' }
+                    if ($g.Italic) { $decoration += ' font-style="italic"' }
+                    if ($g.LineIncrement -gt 0) { $decoration += ' line-increment="{0}"' -f (& $len $g.LineIncrement) }
                     [void]$sb.Append(('<svg:textarea id="{0}"{1} width="{2}" height="{3}" font-family="{4}" font-size="{5}pt" font-weight="{6}" fill="{7}" text-align="{8}"{9} xml:space="preserve">' -f `
                         $id, $position, (& $len $g.Width), (& $len $g.Height), $g.Family, $fontPt, $weight, $g.Color, $align, $decoration))
-                    [void]$sb.Append(((@($g.Text -split "`n") | ForEach-Object { ConvertTo-XmlText $_ }) -join '<svg:tbreak/>'))
+                    if ($null -eq $g.Runs) {
+                        [void]$sb.Append(((@($g.Text -split "`n") | ForEach-Object { ConvertTo-XmlText $_ }) -join '<svg:tbreak/>'))
+                    } else {
+                        # Runs with their own bold, italic, underline or strikethrough as tspans.
+                        foreach ($r in $g.Runs) {
+                            $attrs = ''
+                            if ($null -ne $r.Weight) { $attrs += ' font-weight="{0}"' -f $(if ($r.Weight -ge 700) { 'bold' } elseif ($r.Weight -ge 600) { 'demibold' } else { 'normal' }) }
+                            if ($r.Italic) { $attrs += ' font-style="italic"' }
+                            $lines = @()
+                            if ($r.Underline) { $lines += 'underline' }
+                            if ($r.Strike) { $lines += 'line-through' }
+                            if ($lines.Count) { $attrs += ' text-decoration="{0}"' -f ($lines -join ' ') }
+                            $pieces = @($r.Text -split "`n" | ForEach-Object {
+                                $safe = ConvertTo-XmlText $_
+                                if ($attrs -and $safe) { '<svg:tspan{0}>{1}</svg:tspan>' -f $attrs, $safe } else { $safe }
+                            })
+                            [void]$sb.Append($pieces -join '<svg:tbreak/>')
+                        }
+                    }
                     [void]$sb.Append('</svg:textarea>')
                 }
                 'Image' {
-                    [void]$sb.Append(('<svg:image id="{0}" x="{1}" y="{2}" width="{3}" height="{4}" xlink:href="{5}"/>' -f `
-                        $id, (& $px $g.X), (& $py $g.Y), (& $len $g.Width), (& $len $g.Height), $g.Path))
+                    if ([Math]::Abs($g.Angle) -gt 0.001) {
+                        # Rotated about its top-left corner, in the only form OpenBoard reads.
+                        $position = 'x="0" y="0" transform="translate({0},{1}) rotate({2})"' -f (& $px $g.X), (& $py $g.Y), (Format-Number $g.Angle)
+                    } else {
+                        $position = 'x="{0}" y="{1}"' -f (& $px $g.X), (& $py $g.Y)
+                    }
+                    [void]$sb.Append(('<svg:image id="{0}" {1} width="{2}" height="{3}" xlink:href="{4}"/>' -f `
+                        $id, $position, (& $len $g.Width), (& $len $g.Height), $g.Path))
                 }
             }
             [void]$sb.Append("`r`n")
@@ -1448,15 +1615,27 @@ begin {
         $noteColorMissing = [Collections.Generic.List[string]]::new()
         $inkStrokeCount = 0; $inkApproximated = 0
         $connectorBentCount = 0; $connectorApprox = [Collections.Generic.List[string]]::new()
+        $connectorEmptyCount = 0
+        $styledRunTexts = 0
+        # FluidImage (first seen in RotatedTest1) is an ordinary embedded image.
+        $imageTypes = @('Image', 'AzureImage', 'FluidImage')
+        $rotatedImageCount = 0
+        # Shape text has no inline font-family: the stylesheet's ".textbox.shapeText" uses
+        # var(--fontFamilySimple), "Aptos","Segoe UI",... in every export seen.
+        $simpleFamily = Get-FontFamily ('font-family: ' + [string](Get-FirstMatch $html '--fontFamilySimple\s*:\s*([^;}]+)')) $TextFontFamily
         foreach ($block in $blocks) {
             $a = Get-AnchorInfo $block
             if (-not $a.Type) { continue }
             if (-not $sourceTypes.ContainsKey($a.Type)) { $sourceTypes[$a.Type] = 0 }
             $sourceTypes[$a.Type]++
-            # PlainText, shapes and ink keep their rotation; other rotated objects keep their size
-            # but are drawn unrotated -- counted so the summary can say so.
+            # PlainText, shapes, connectors and ink keep their rotation, and images and stickers
+            # are rotated about their corner; rotated notes (and mirrored images, which IWB's
+            # translate/rotate can't express) keep their size but are drawn unrotated -- counted
+            # so the summary can say so.
+            $mirrored = (($a.MA * $a.MD) - ($a.MB * $a.MC)) -lt 0
             if ($a.IsRotated -and $a.Type -eq 'Shape') { $rotatedShapeCount++ }
-            elseif ($a.IsRotated -and $a.Type -notin 'PlainText','InkGroup') { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
+            elseif ($a.IsRotated -and $a.Type -in $imageTypes -and -not $mirrored) { $rotatedImageCount++ }
+            elseif ($a.IsRotated -and $a.Type -notin 'PlainText','InkGroup','Connector','ReactionStickers') { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
             $groupNumber++
             $group = 'g' + $groupNumber
 
@@ -1494,7 +1673,8 @@ begin {
                     $drawn = Add-IwbShape $graphics (ConvertTo-BoardPoints $a $local) $fill $stroke $strokeWidth $dash $group
                     if ($drawn -eq 'Edges') { $shapeEdgesCount++ }
 
-                    $shapeText = Get-HtmlText $block
+                    $shapeRuns = Get-TextRuns $block
+                    $shapeText = -join @($shapeRuns | ForEach-Object { $_.Text })
                     if (-not [string]::IsNullOrEmpty($shapeText)) {
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
@@ -1507,12 +1687,15 @@ begin {
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
                         $shapeWeight = Get-FontWeight $shapeCoreStyle 700
                         $shapeUnderline = Test-Underline $shapeCoreStyle
-                        $shapeFamily = Get-FontFamily $shapeCoreStyle $TextFontFamily
+                        $shapeFamily = Get-FontFamily $shapeCoreStyle $simpleFamily
+                        $shapeStyled = Test-StyledRuns $shapeRuns
+                        if ($shapeStyled) { $styledRunTexts++ }
                         # The text box turns with the shape.
                         Add-IwbText $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) ($textHeight * $a.ScaleY) `
                             ($fontLocal * $a.ScaleY) $textColor $textAlign `
                             ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) `
-                            -Weight $shapeWeight -Family $shapeFamily -Group $group -Underline $shapeUnderline
+                            -Weight $shapeWeight -Family $shapeFamily -Group $group -Underline $shapeUnderline `
+                            -Italic (Test-Italic $shapeCoreStyle) -LineHeight (Get-LineHeight $shapeCoreStyle $fontLocal) -Runs $(if ($shapeStyled) { $shapeRuns } else { $null })
                         if ($a.IsRotated) { $rotatedTextCount++ }
                         if ($shapeUnderline) {
                             if (-not $a.IsRotated -and (Add-IwbUnderline $graphics $shapeText $origin[0][0] $origin[0][1] ($innerWidth * $a.ScaleX) `
@@ -1522,7 +1705,10 @@ begin {
                     }
                 }
                 'PlainText' {
-                    $text = Get-HtmlText $block
+                    $runs = Get-TextRuns $block
+                    $text = -join @($runs | ForEach-Object { $_.Text })
+                    $styled = Test-StyledRuns $runs
+                    if ($styled) { $styledRunTexts++ }
                     $textBoxStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+plainText\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                     $outerStyle = Get-FirstMatch $block '<div\s+style="([^"]*width:[^"]*display:\s*flex[^"]*)"'
@@ -1547,15 +1733,15 @@ begin {
                     # inset rotates with it.
                     $textX = $a.X + ($a.MA * $insetLeft) + ($a.MC * $insetTop)
                     $textY = $a.Y + ($a.MB * $insetLeft) + ($a.MD * $insetTop)
+                    $extra = @{ Weight = $weight; Family = $family; Group = $textGroup; Underline = $underline; Italic = (Test-Italic $coreStyle)
+                                LineHeight = (Get-LineHeight $coreStyle ($font / $a.ScaleY)); Runs = $(if ($styled) { $runs } else { $null }) }
                     if ($a.IsRotated) {
                         $rotatedTextCount++
                         Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align `
-                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) -Weight $weight `
-                            -Family $family -Group $textGroup -Underline $underline
+                            ($a.MA / $a.ScaleX) ($a.MB / $a.ScaleX) ($a.MC / $a.ScaleY) ($a.MD / $a.ScaleY) @extra
                         if ($underline) { $underlineNotDrawn++ }
                     } else {
-                        Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align -Weight $weight `
-                            -Family $family -Group $textGroup -Underline $underline
+                        Add-IwbText $graphics $text $textX $textY $width 0 $font $color $align @extra
                         if ($underline) {
                             if (Add-IwbUnderline $graphics $text $textX $textY $width $font $color $align $weight $family $group) { $underlineDrawn++ }
                             else { $underlineNotDrawn++ }
@@ -1563,7 +1749,10 @@ begin {
                     }
                 }
                 'Note' {
-                    $text = Get-HtmlText $block
+                    $noteRuns = Get-TextRuns $block
+                    $text = -join @($noteRuns | ForEach-Object { $_.Text })
+                    $noteStyled = Test-StyledRuns $noteRuns
+                    if ($noteStyled -and $text.Trim()) { $styledRunTexts++ }
                     $noteStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+stickyNote\b[^"]*"[^>]*style="([^"]*)"'
                     $coreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                     $note = Get-NoteLayout $block $noteColors
@@ -1593,7 +1782,8 @@ begin {
                         $noteTextX = $a.X + ($note.TextLeft * $a.ScaleX); $noteTextY = $a.Y + (($note.TextTop - $noteRaise) * $a.ScaleY)
                         $noteTextW = ($cssW - $NoteTextColumnInset) * $a.ScaleX
                         Add-IwbText $graphics $text $noteTextX $noteTextY $noteTextW (($cssH - $note.Border - 12 + $noteRaise) * $a.ScaleY) `
-                            ($noteFont * $a.ScaleY) $color 'left' -Weight $noteWeight -Family $NoteFontFamily -Group $group -Underline $noteUnderline
+                            ($noteFont * $a.ScaleY) $color 'left' -Weight $noteWeight -Family $NoteFontFamily -Group $group -Underline $noteUnderline `
+                            -Italic (Test-Italic $coreStyle) -Runs $(if ($noteStyled) { $noteRuns } else { $null })
                         if ($noteUnderline) {
                             if (Add-IwbUnderline $graphics $text $noteTextX $noteTextY $noteTextW ($noteFont * $a.ScaleY) $color 'left' `
                                     $noteWeight $NoteFontFamily $group) { $underlineDrawn++ }
@@ -1616,9 +1806,20 @@ begin {
                     $svgTag = Get-FirstMatch $block '(<svg\b[^>]*>)'
                     $gTag = Get-FirstMatch $block '(<g\b[^>]*>)'
                     $line = Get-ConnectorPoints $block
-                    if ($line) {
+                    # Elbow connectors wrap their <svg> in <div style="position: relative; left: 0px;
+                    # top: -16px;">, which moves the whole drawing: -16px on most, -1220px on one
+                    # in RotatedTest1. Ignoring it put the line and arrowheads that far too low.
+                    $offset = [regex]::Match($block, '<div\s+style="\s*position:\s*relative;\s*left:\s*(-?[0-9.]+)px;\s*top:\s*(-?[0-9.]+)px;?\s*">\s*<svg\b',
+                        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                    $offX = 0.0; $offY = 0.0
+                    if ($offset.Success) { $offX = Get-Number $offset.Groups[1].Value 0; $offY = Get-Number $offset.Groups[2].Value 0 }
+                    $linePts = $null
+                    if ($line -and $line.Points.Count -ge 2) {
                         $linePts = $line.Points
                         if (-not $line.Exact) { [void]$connectorApprox.Add("$($a.Type):$($a.Key)") }
+                    } elseif ($line) {
+                        # A zero-length line ("M11 11L11 11") draws nothing in Whiteboard.
+                        $connectorEmptyCount++
                     } else {
                         # No readable path: the diagonal of the connector's SVG box.
                         $w = Get-Number (Get-FirstMatch $svgTag '\bwidth="([0-9.]+)"') 10
@@ -1634,9 +1835,13 @@ begin {
                         $dash = [double[]]@($dash | ForEach-Object { $_ * $a.ScaleX })
                     }
                     # Elbow and curved connectors become one edge per bend (or flattened step).
-                    $boardPts = @($linePts | ForEach-Object { ,([double[]]@(($a.X + ($_[0] * $a.ScaleX)), ($a.Y + ($_[1] * $a.ScaleY)))) })
-                    Add-IwbPolyline $graphics $boardPts -Stroke $stroke -StrokeWidth $strokeWidth -Dash $dash -Group $group
-                    if ($boardPts.Count -gt 2) { $connectorBentCount++ }
+                    if ($linePts) {
+                        $shifted = New-Object Collections.Generic.List[double[]]
+                        foreach ($p in $linePts) { [void]$shifted.Add([double[]]@(($p[0] + $offX), ($p[1] + $offY))) }
+                        $boardPts = ConvertTo-BoardPoints $a $shifted.ToArray()
+                        Add-IwbPolyline $graphics $boardPts -Stroke $stroke -StrokeWidth $strokeWidth -Dash $dash -Group $group
+                        if ($boardPts.Count -gt 2) { $connectorBentCount++ }
+                    }
                     # Arrowheads: each is its own open chevron path inside the connector's <g>,
                     # e.g. d="M-5 -9 L0 0 L5 -9" transform="translate(x,y), rotate(deg)" (tip at the
                     # local origin), drawn solid. Each becomes its two edges, grouped with the line.
@@ -1651,11 +1856,11 @@ begin {
                         $arrowPts = New-Object Collections.Generic.List[double[]]
                         for ($k = 0; $k -lt $aNums.Count; $k += 2) {
                             # SVG "translate(t), rotate(r)": rotate the point, then translate it.
-                            $lx = ($aNums[$k] * $cos) - ($aNums[$k + 1] * $sin) + $tx
-                            $ly = ($aNums[$k] * $sin) + ($aNums[$k + 1] * $cos) + $ty
-                            [void]$arrowPts.Add([double[]]@(($a.X + ($lx * $a.ScaleX)), ($a.Y + ($ly * $a.ScaleY))))
+                            $lx = ($aNums[$k] * $cos) - ($aNums[$k + 1] * $sin) + $tx + $offX
+                            $ly = ($aNums[$k] * $sin) + ($aNums[$k + 1] * $cos) + $ty + $offY
+                            [void]$arrowPts.Add([double[]]@($lx, $ly))
                         }
-                        Add-IwbPolyline $graphics $arrowPts.ToArray() $stroke $strokeWidth $null $group
+                        Add-IwbPolyline $graphics (ConvertTo-BoardPoints $a $arrowPts.ToArray()) $stroke $strokeWidth $null $group
                         $arrowheadCount++
                     }
                 }
@@ -1677,8 +1882,8 @@ begin {
                         }
                     }
                     $w = $boxW * $a.ScaleX; $h = $boxH * $a.ScaleY
-                    $x = $a.X; $y = $a.Y
-                    if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
+                    $place = Get-ImagePlacement $a $boxW $boxH
+                    $x = $place.X; $y = $place.Y
                     if ($stickerData) {
                         # Whiteboard's own sticker artwork, rasterised to PNG below.
                         $raster = $null
@@ -1688,21 +1893,25 @@ begin {
                             $rh = if ($aspect -ge 1) { [Math]::Max(1.0, [Math]::Round($StickerRasterSize / $aspect)) } else { $StickerRasterSize }
                             $raster = [pscustomobject]@{ Mime = $stickerData.Mime; Width = [int]$rw; Height = [int]$rh }
                         }
-                        Add-IwbImage $graphics $x $y $w $h $stickerData.Bytes $stickerData.Extension $raster
+                        Add-IwbImage $graphics $x $y $w $h $stickerData.Bytes $stickerData.Extension $raster -Angle $place.Angle
                         $stickerImageCount++
+                        if ($a.IsRotated) { if ($place.Rotated) { $rotatedImageCount++ } else { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") } }
                     } else {
+                        $x = $a.X; $y = $a.Y
+                        if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
                         Add-IwbReactionSticker $graphics $label $x $y $w $h $group
                         $stickerFallbackCount++
+                        if ($a.IsRotated) { [void]$rotationIgnored.Add("$($a.Type):$($a.Key)") }
                     }
                 }
-                {$_ -in 'Image', 'AzureImage'} {
+                {$_ -in $imageTypes} {
                     $src = Get-FirstMatch $block '<img\b[^>]*\bsrc="([^"]+)"'
                     if (-not $src) { [void]$unsupported.Add("$($a.Type):$($a.Key) (missing image data)"); break }
                     $src = [Net.WebUtility]::HtmlDecode($src)
                     $size = Get-ImageSize $block
                     $w = $size.Width * $a.ScaleX; $h = $size.Height * $a.ScaleY
-                    $x = $a.X; $y = $a.Y
-                    if ($a.IsCentered) { $x -= $w / 2; $y -= $h / 2 }
+                    $place = Get-ImagePlacement $a $size.Width $size.Height
+                    $x = $place.X; $y = $place.Y
                     $mime = Get-FirstMatch $src '^data:([^;,]+)'
                     if (-not $mime) { [void]$unsupported.Add("$($a.Type):$($a.Key) (external image URL)"); break }
                     $commaIndex = $src.IndexOf(',')
@@ -1724,7 +1933,7 @@ begin {
                         $raster = [pscustomobject]@{ Mime = $mime; Width = [int][Math]::Min(4096.0, [Math]::Max(1.0, [Math]::Ceiling($w * 2)))
                                                      Height = [int][Math]::Min(4096.0, [Math]::Max(1.0, [Math]::Ceiling($h * 2))) }
                     }
-                    Add-IwbImage $graphics $x $y $w $h ([Convert]::FromBase64String($payload)) $extension $raster
+                    Add-IwbImage $graphics $x $y $w $h ([Convert]::FromBase64String($payload)) $extension $raster -Angle $place.Angle
                 }
                 default { [void]$unsupported.Add("$($a.Type):$($a.Key)") }
             }
@@ -1787,7 +1996,8 @@ begin {
             UnderlinesDrawn = $underlineDrawn; UnderlinesNotDrawn = $underlineNotDrawn
             NoteColorMissing = $noteColorMissing.Count; NoteColorMissingDetails = @($noteColorMissing)
             InkStrokes = $inkStrokeCount; InkApproximated = $inkApproximated
-            ConnectorsBent = $connectorBentCount
+            ConnectorsBent = $connectorBentCount; ConnectorsEmpty = $connectorEmptyCount
+            RotatedImagesConverted = $rotatedImageCount; StyledRunTexts = $styledRunTexts
             ConnectorsApproximated = $connectorApprox.Count; ConnectorsApproximatedDetails = @($connectorApprox)
         }
     }
@@ -1829,6 +2039,12 @@ process {
         if ($result.RotatedShapesConverted -gt 0) {
             Write-Host ("  {0} rotated shape(s) converted with their rotation." -f $result.RotatedShapesConverted)
         }
+        if ($result.RotatedImagesConverted -gt 0) {
+            Write-Host ("  {0} rotated image(s)/sticker(s) converted with their rotation." -f $result.RotatedImagesConverted)
+        }
+        if ($result.ConnectorsEmpty -gt 0) {
+            Write-Host ("  {0} zero-length connector(s) skipped (Whiteboard draws nothing for them)." -f $result.ConnectorsEmpty)
+        }
         if ($result.RotationIgnored -gt 0) {
             Write-Warning ("{0} rotated non-text object(s) were drawn unrotated (correct size): {1}" -f `
                 $result.RotationIgnored, ($result.RotationIgnoredDetails -join ', '))
@@ -1866,6 +2082,9 @@ process {
         }
         if ($result.UnderlinesNotDrawn -gt 0) {
             Write-Warning ("{0} underlined text(s) are wrapped or rotated, so only carry text-decoration: OpenBoard shows them without an underline." -f $result.UnderlinesNotDrawn)
+        }
+        if ($result.StyledRunTexts -gt 0) {
+            Write-Warning ("{0} text(s) are partly bold, italic or underlined: kept as tspans, but OpenBoard's importer may show the whole text in one style." -f $result.StyledRunTexts)
         }
         if ($result.UnsupportedObjects -gt 0) {
             Write-Warning ("{0} object(s) were unsupported. Details: {1}" -f `

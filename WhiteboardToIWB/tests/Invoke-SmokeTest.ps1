@@ -71,11 +71,16 @@ function Get-SourceExpectations {
     $html = [IO.File]::ReadAllText($HtmlPath, [Text.Encoding]::UTF8)
     $starts = [regex]::Matches($html, '(?=<div\s+class="anchor\b)', 'IgnoreCase')
     $texts = New-Object Collections.Generic.List[string]
-    $counts = @{ Shape = 0; Oval = 0; Sticker = 0; Arrowhead = 0; Connector = 0; Rotated = 0; RotatedText = 0; RotatedShape = 0 }
-    # Span text as a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF.
+    $counts = @{ Shape = 0; Oval = 0; Sticker = 0; Arrowhead = 0; Connector = 0; Rotated = 0; RotatedText = 0; RotatedShape = 0; RotatedImage = 0 }
+    # Span text as a browser reads it: Whiteboard keeps soft line breaks as a raw CR or CRLF,
+    # and each Draft.js block (<div data-block="true">) is a paragraph of its own.
     $spanText = { param($b)
-        $spans = [regex]::Matches($b, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
-        ((@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '') -replace "`r`n?", "`n") }
+        $paras = @([regex]::Matches($b, '<div\b[^>]*\bdata-block="true"[^>]*>(.*?)(?=<div\b[^>]*\bdata-block="true"|$)', $RxOpts) | ForEach-Object { $_.Groups[1].Value })
+        if ($paras.Count -eq 0) { $paras = @($b) }
+        (@($paras | ForEach-Object {
+            $spans = [regex]::Matches($_, '<span\s+data-text="true"[^>]*>(.*?)</span>', $RxOpts)
+            (@($spans | ForEach-Object { [Net.WebUtility]::HtmlDecode(($_.Groups[1].Value -replace '<[^>]+>', '')) }) -join '')
+        }) -join "`n") -replace "`r`n?", "`n" }
     for ($i = 0; $i -lt $starts.Count; $i++) {
         $start = $starts[$i].Index
         $end = if ($i + 1 -lt $starts.Count) { $starts[$i + 1].Index } else { $html.Length }
@@ -90,7 +95,11 @@ function Get-SourceExpectations {
                 # PlainText and shapes are drawn rotated (a shape's label turns with it).
                 if ($type -eq 'PlainText') { $counts.RotatedText++ }
                 elseif ($type -eq 'Shape') { $counts.RotatedShape++; if ((& $spanText $block).Trim()) { $counts.RotatedText++ } }
-                else { $counts.Rotated++ }
+                # Images and stickers are rotated about their corner (not when mirrored, which
+                # translate/rotate can't express); connectors and ink are mapped through the
+                # matrix. Notes are left unrotated.
+                elseif ($type -in 'Image', 'AzureImage', 'FluidImage', 'ReactionStickers' -and (($v[0] * $v[3]) - ($v[1] * $v[2])) -gt 0) { $counts.RotatedImage++ }
+                elseif ($type -notin 'Connector', 'InkGroup') { $counts.Rotated++ }
             }
         }
         switch ($type) {
@@ -112,7 +121,7 @@ function Get-SourceExpectations {
     }
     [pscustomobject]@{ Texts = $texts; Shapes = $counts.Shape; Ovals = $counts.Oval; Stickers = $counts.Sticker
                        Connectors = $counts.Connector; Arrowheads = $counts.Arrowhead; RotatedNonText = $counts.Rotated
-                       RotatedText = $counts.RotatedText; RotatedShapes = $counts.RotatedShape }
+                       RotatedText = $counts.RotatedText; RotatedShapes = $counts.RotatedShape; RotatedImages = $counts.RotatedImage }
 }
 
 # ------------------------------------------------------------------------------------------
@@ -183,7 +192,7 @@ function Test-Iwb {
         $num = { param($el, $name) $v = $el.GetAttribute($name); if ($v -notmatch $numberRx) { $bad.Numbers++ }; [double]::Parse($(if ($v) { $v } else { '0' }), [Globalization.NumberStyles]::Float, $ci) }
         $elements = @($page.ChildNodes | Where-Object { $_.NodeType -eq 'Element' })
         $outTexts = New-Object Collections.Generic.List[string]
-        $rotatedText = 0; $roundCount = 0; $images = 0; $polylines = 0
+        $rotatedText = 0; $rotatedImages = 0; $roundCount = 0; $images = 0; $polylines = 0
         $edgeGroups = @{}
         foreach ($el in $elements) {
             $tag = $el.LocalName
@@ -224,6 +233,7 @@ function Test-Iwb {
                     if ($el.GetAttribute('font-size') -notmatch '^\d+(\.\d+)?pt$') { Add-Issue 'FAIL' "<textarea id=$id> font-size '$($el.GetAttribute('font-size'))' is not in pt" }
                     if ($el.GetAttribute('font-weight') -notin 'normal', 'demibold', 'bold') { Add-Issue 'FAIL' "<textarea id=$id> font-weight '$($el.GetAttribute('font-weight'))' (OpenBoard maps only names)" }
                     if ($el.GetAttribute('text-align') -notin 'start', 'center', 'end') { Add-Issue 'FAIL' "<textarea id=$id> text-align '$($el.GetAttribute('text-align'))'" }
+                    if ($el.HasAttribute('line-increment')) { [void](& $num $el 'line-increment') }
                     $tr = $el.GetAttribute('transform')
                     if ($tr) {
                         $tm = [regex]::Match($tr, '^translate\((-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\) rotate\((-?\d+(?:\.\d+)?)\)$')
@@ -237,6 +247,12 @@ function Test-Iwb {
                     foreach ($c in $el.ChildNodes) {
                         if ($c.NodeType -eq 'Text' -or $c.NodeType -eq 'SignificantWhitespace' -or $c.NodeType -eq 'Whitespace') { [void]$text.Append($c.Value) }
                         elseif ($c.NodeType -eq 'Element' -and $c.LocalName -eq 'tbreak' -and $c.NamespaceURI -eq $SVG_NS) { [void]$text.Append("`n") }
+                        elseif ($c.NodeType -eq 'Element' -and $c.LocalName -eq 'tspan' -and $c.NamespaceURI -eq $SVG_NS) {
+                            # A run with its own styling: plain text only, weights by name.
+                            if ($c.HasAttribute('font-weight') -and $c.GetAttribute('font-weight') -notin 'normal', 'demibold', 'bold') { Add-Issue 'FAIL' "<tspan> in <textarea id=$id> has font-weight '$($c.GetAttribute('font-weight'))'" }
+                            if (@($c.ChildNodes | Where-Object { $_.NodeType -eq 'Element' }).Count) { Add-Issue 'FAIL' "<tspan> in <textarea id=$id> holds elements" }
+                            [void]$text.Append($c.InnerText)
+                        }
                         else { Add-Issue 'FAIL' "<textarea id=$id> contains <$($c.Name)>" }
                     }
                     $outTexts.Add($text.ToString())
@@ -244,7 +260,16 @@ function Test-Iwb {
                 'image' {
                     $images++
                     $x = & $num $el 'x'; $y = & $num $el 'y'; $w = & $num $el 'width'; $h = & $num $el 'height'
-                    if (-not ((& $inPage $x $y) -and (& $inPage ($x + $w) ($y + $h)))) { $outside++ }
+                    $tr = $el.GetAttribute('transform')
+                    if ($tr) {
+                        # A rotated image, in the only transform form OpenBoard reads.
+                        $tm = [regex]::Match($tr, '^translate\((-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\) rotate\((-?\d+(?:\.\d+)?)\)$')
+                        if (-not $tm.Success -or $x -ne 0 -or $y -ne 0) { Add-Issue 'FAIL' "<image id=$id> transform '$tr' is not 'translate(x,y) rotate(a)' at 0,0" }
+                        else {
+                            $rotatedImages++
+                            if (-not (& $inPage ([double]::Parse($tm.Groups[1].Value, $ci)) ([double]::Parse($tm.Groups[2].Value, $ci)))) { $outside++ }
+                        }
+                    } elseif (-not ((& $inPage $x $y) -and (& $inPage ($x + $w) ($y + $h)))) { $outside++ }
                     $href = $el.GetAttribute('href', $XLINK_NS)
                     if (-not $entries.ContainsKey($href)) { Add-Issue 'FAIL' "image '$href' is referenced but not in the archive"; continue }
                     $fmt = Get-ImageFormat (Read-EntryBytes $entries[$href])
@@ -288,7 +313,8 @@ function Test-Iwb {
             Add-Issue 'FAIL' "connectors: expected at least $($Expect.Connectors + (2 * $Expect.Arrowheads)) polylines, found $polylines"
         }
         if ($rotatedText -ne $Expect.RotatedText) { Add-Issue 'FAIL' "rotated text: export has $($Expect.RotatedText), .iwb has $rotatedText" }
-        if ($Expect.RotatedNonText -gt 0) { Add-Issue 'WARN' "$($Expect.RotatedNonText) rotated non-shape object(s) in the export (drawn unrotated)" }
+        if ($rotatedImages -ne $Expect.RotatedImages) { Add-Issue 'FAIL' "rotated images/stickers: export has $($Expect.RotatedImages), .iwb has $rotatedImages" }
+        if ($Expect.RotatedNonText -gt 0) { Add-Issue 'WARN' "$($Expect.RotatedNonText) rotated note(s) or mirrored image(s) in the export (drawn unrotated)" }
 
         # ---- Converter's own counters ----
         $traced = & $prop 'ShapesTraced'; $fromLabel = & $prop 'ShapesFromLabel'

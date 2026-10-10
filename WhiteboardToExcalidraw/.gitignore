@@ -5,5 +5,7 @@ tests/visual/node_modules/
 __pycache__/
 *.pyc
 
-# Local screenshot of a sample board, not part of the export
+# Local screenshots (and a native .whiteboard file) of sample boards, not part of the export
 samples/CompareAndContrast2/CompareAndContrast2.png
+samples/RotatedTest1/RotatedTest1.png
+samples/RotatedTest1/RotatedTest1.whiteboard
