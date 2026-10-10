@@ -722,6 +722,82 @@ begin {
         return $Default
     }
 
+    function Get-TextMeasurer {
+        # A scriptblock giving a string's advance width in px in the given face (System.Drawing,
+        # typographic layout). Without the face or System.Drawing, 0.58 em per character.
+        param([string]$Family, [double]$FontSize, [int]$Weight = 400, [bool]$Italic = $false)
+        $font = $null
+        if ((Get-InstalledFontNames).Contains($Family)) {
+            try {
+                $style = [Drawing.FontStyle]::Regular
+                if ($Weight -ge 600) { $style = $style -bor [Drawing.FontStyle]::Bold }
+                if ($Italic) { $style = $style -bor [Drawing.FontStyle]::Italic }
+                $font = New-Object Drawing.Font($Family, [single]$FontSize, $style, [Drawing.GraphicsUnit]::Pixel)
+                if ($null -eq $script:MeasureGraphics) {
+                    $script:MeasureGraphics = [Drawing.Graphics]::FromImage((New-Object Drawing.Bitmap 1, 1))
+                    $script:MeasureGraphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAlias
+                    $script:MeasureFormat = [Drawing.StringFormat]::GenericTypographic.Clone()
+                    $script:MeasureFormat.FormatFlags = $script:MeasureFormat.FormatFlags -bor [Drawing.StringFormatFlags]::MeasureTrailingSpaces
+                }
+            } catch { $font = $null }
+        }
+        if ($null -eq $font) {
+            $em = $FontSize * 0.58
+            return { param([string]$s) $s.Length * $em }.GetNewClosure()
+        }
+        $g = $script:MeasureGraphics; $f = $script:MeasureFormat; $origin = New-Object Drawing.PointF 0, 0
+        return { param([string]$s) if ($s.Length -eq 0) { 0.0 } else { [double]$g.MeasureString($s, $font, $origin, $f).Width } }.GetNewClosure()
+    }
+
+    function Get-TextLineStarts {
+        # Where each line of a text box starts, as character offsets into $Text, wrapped as a
+        # browser wraps it: each paragraph on its own, greedily at spaces (trailing spaces
+        # hang), and a word wider than the column broken between characters.
+        param([string]$Text, [double]$Width, [scriptblock]$Measure)
+        $starts = New-Object Collections.Generic.List[int]
+        $offset = 0
+        foreach ($paragraph in ($Text -split "`n")) {
+            $starts.Add($offset)
+            $lineStart = 0; $pos = 0
+            while ($pos -lt $paragraph.Length) {
+                $wordEnd = $pos
+                while ($wordEnd -lt $paragraph.Length -and $paragraph[$wordEnd] -ne ' ') { $wordEnd++ }
+                if ((& $Measure $paragraph.Substring($lineStart, $wordEnd - $lineStart)) -le $Width + 0.01) {
+                    $pos = $wordEnd
+                    while ($pos -lt $paragraph.Length -and $paragraph[$pos] -eq ' ') { $pos++ }
+                } elseif ($pos -gt $lineStart) {
+                    $starts.Add($offset + $pos); $lineStart = $pos
+                } else {
+                    $end = $lineStart + 1
+                    while ($end -lt $wordEnd -and (& $Measure $paragraph.Substring($lineStart, $end + 1 - $lineStart)) -le $Width + 0.01) { $end++ }
+                    $starts.Add($offset + $end); $lineStart = $end; $pos = $end
+                }
+            }
+            $offset += $paragraph.Length + 1
+        }
+        return ,($starts.ToArray())
+    }
+
+    function Select-TextRuns {
+        # The runs cut to their first $Length characters.
+        param([object[]]$Runs, [int]$Length)
+        $kept = New-Object Collections.Generic.List[object]
+        $left = $Length
+        foreach ($r in $Runs) {
+            if ($left -le 0) { break }
+            $copy = $r.PSObject.Copy()
+            if ($copy.Text.Length -gt $left) { $copy.Text = $copy.Text.Substring(0, $left) }
+            $left -= $copy.Text.Length
+            [void]$kept.Add($copy)
+        }
+        return ,($kept.ToArray())
+    }
+
+    function Test-Italic {
+        param([string]$Style)
+        return "$(Get-StyleValue $Style 'font-style')" -match '(italic|oblique)'
+    }
+
     function Test-Underline {
         # Whiteboard underlines a whole text box with text-decoration on its textBoxCore div.
         param([string]$Style)
@@ -1212,7 +1288,7 @@ begin {
         $destBaseName = [IO.Path]::GetFileNameWithoutExtension($DestinationPath)
         $imageOutputDir = Join-Path (Split-Path -Parent $DestinationPath) "${destBaseName}_images"
         $stickerImageCount = 0; $stickerFallbackCount = 0
-        $shapeTracedCount = 0; $shapeFallbackCount = 0
+        $shapeTracedCount = 0; $shapeFallbackCount = 0; $shapeTextClippedCount = 0; $shapeLinesHiddenCount = 0
         $rotatedCount = 0; $underlinedCount = 0; $mirrorIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
         $connectorBentCount = 0; $connectorApprox = [Collections.Generic.List[string]]::new()
@@ -1311,8 +1387,6 @@ begin {
                     $shapeRuns = Get-TextRuns $block
                     $shapeText = -join @($shapeRuns | ForEach-Object { $_.Text })
                     if (-not [string]::IsNullOrEmpty($shapeText)) {
-                        # Excalidraw text has one style: per-run bold, italic and underline are lost.
-                        if (Test-StyledRuns $shapeRuns) { $styledRunTexts++ }
                         $shapeTextStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextbox\s+shapeText\b[^"]*"[^>]*style="([^"]*)"'
                         $shapeCoreStyle = Get-FirstMatch $block '<div[^>]*class="[^"]*\btextBoxCore\b[^"]*"[^>]*style="([^"]*)"'
                         $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
@@ -1320,10 +1394,37 @@ begin {
                         if ($shapeFamily -ne 'Arial') { $fontSubstituted++ }
                         $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1.0, $lw - 26))
                         $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1.0, $lh - 26))
+                        $shapeWeight = Get-FontWeight $shapeCoreStyle 700
+                        # The label is a flex column centred in the shape's text box, which has
+                        # overflow-y: hidden. Text taller than the box starts at its top instead,
+                        # and Whiteboard shows only the lines that fit; it used to be drawn whole,
+                        # running far past the shape. Lines at least half inside are kept. The
+                        # lines are wrapped in Whiteboard's own face, not Excalidraw's.
+                        $shapeLineHeight = Get-LineHeight $shapeCoreStyle $fontLocal
+                        if ($shapeLineHeight -le 0) {
+                            $metrics = Get-FontLineMetrics $shapeFamily $shapeWeight
+                            $shapeLineHeight = if ($null -ne $metrics) { $metrics.Normal } else { $TextLineHeight }
+                        }
+                        $linePx = $shapeLineHeight * $fontLocal
+                        $lineStarts = Get-TextLineStarts $shapeText $innerWidth (Get-TextMeasurer $shapeFamily $fontLocal $shapeWeight (Test-Italic $shapeCoreStyle))
+                        $wbHeight = $lineStarts.Count * $linePx
+                        if ($wbHeight -gt $innerHeight + 0.01) {
+                            $wbHeight = $innerHeight
+                            $visibleLines = [Math]::Max(1, [int][Math]::Floor(($innerHeight / $linePx) + 0.5))
+                            if ($visibleLines -lt $lineStarts.Count) {
+                                $shapeText = $shapeText.Substring(0, $lineStarts[$visibleLines]).TrimEnd()
+                                $shapeRuns = Select-TextRuns $shapeRuns $shapeText.Length
+                                $shapeTextClippedCount++
+                                $shapeLinesHiddenCount += $lineStarts.Count - $visibleLines
+                            }
+                        }
+                        if (-not $shapeText) { break }
+                        # Excalidraw text has one style: per-run bold, italic and underline are lost.
+                        if (Test-StyledRuns $shapeRuns) { $styledRunTexts++ }
                         $textHeight = [Math]::Min($innerHeight, (Get-TextBlockHeight $shapeText $innerWidth $fontLocal))
-                        $adj = Get-LineHeightAdjustment (Get-LineHeight $shapeCoreStyle $fontLocal) $shapeFamily (Get-FontWeight $shapeCoreStyle 700)
+                        $adj = Get-LineHeightAdjustment (Get-LineHeight $shapeCoreStyle $fontLocal) $shapeFamily $shapeWeight
                         $shift = if ($adj) { $adj.Shift * $fontLocal } else { 0.0 }
-                        $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $textHeight) / 2) + $shift) $innerWidth $textHeight
+                        $p = Get-BoxPlacement $a ($u0 + (($lw - $innerWidth) / 2)) ($v0 + (($lh - $wbHeight) / 2) + $shift) $innerWidth $textHeight
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
                         $underline = Test-Underline $shapeCoreStyle
@@ -1588,6 +1689,7 @@ begin {
             ImageFiles=@($imageFilesWritten)
             StickersEmbedded=$stickerImageCount; StickersFallback=$stickerFallbackCount
             ShapesTraced=$shapeTracedCount; ShapesFromLabel=$shapeFallbackCount
+            ShapeTextClipped=$shapeTextClippedCount; ShapeTextLinesHidden=$shapeLinesHiddenCount
             RotatedObjects=$rotatedCount; ArrowheadsConverted=$arrowheadCount
             ConnectorsBent=$connectorBentCount
             ConnectorsApproximated=$connectorApprox.Count; ConnectorsApproximatedDetails=@($connectorApprox)
@@ -1634,6 +1736,9 @@ process {
         }
         if ($result.ConnectorsBent -gt 0) {
             Write-Host ("  {0} elbow/curved connector(s) traced through every bend." -f $result.ConnectorsBent)
+        }
+        if ($result.ShapeTextClipped -gt 0) {
+            Write-Host ("  {0} shape label(s) taller than their shape were cut to the lines Whiteboard shows ({1} line(s) hidden)." -f $result.ShapeTextClipped, $result.ShapeTextLinesHidden)
         }
         if ($result.ConnectorsEmpty -gt 0) {
             Write-Host ("  {0} zero-length connector(s) skipped (Whiteboard draws nothing for them)." -f $result.ConnectorsEmpty)
