@@ -97,15 +97,44 @@ def convert(ps: list[str], script: Path, html: Path, out_dir: Path) -> tuple[Pat
 
 # ----------------------------------------------------------------------------------------
 # Whiteboard side: measure the export in the browser
+# A text element's first-line baseline in screen y, as an unrounded renderer would place it
+# (JS function source). Text y is compared there on both sides, not at the Range box top: that
+# is the content-area top, which includes CSS half-leading that Chromium rounds to whole px.
+# Chromium also rounds the ascent to whole px at the font size it lays out, and Whiteboard lays
+# out at 34 px and scales while the stand-in lays out at the final size, so even the drawn
+# baselines differ by up to 0.5 px x scale (2.1 px on KWL's 187 px letters). So this takes the
+# line top (a zero-size vertical-align:top marker) plus the drawn top-to-baseline distance
+# (a zero-size baseline marker), rescaled by the unrounded distance over Chromium's rounded one,
+# both read from unscaled probes of the same font (the unrounded one at 1000 px). A probe needs
+# text: in quirks mode (no doctype) a line of only empty inline-blocks gets no strut.
+# Returns screen [x, y]: the baseline across the line, the Range rect `rect` along it, so a
+# label rotated by 90 degrees is measured across its line in x.
+BASELINE = r"""(el, rect) => {
+  const cs = getComputedStyle(el), F = parseFloat(cs.fontSize);
+  const lh = cs.lineHeight === 'normal' ? 'normal' : String(parseFloat(cs.lineHeight) / F);
+  const mark = va => { const k = document.createElement('span');
+    k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0;vertical-align:' + va; return k; };
+  // Word joiners keep both markers on the first glyph's line: an inline-block is a break
+  // opportunity, and a glyph wider than its column (KWL's "W") would wrap away from them.
+  const span = host => { const t = mark('top'), b = mark('baseline');
+    const j = [0, 1].map(() => document.createTextNode('\u2060'));
+    host.insertBefore(j[1], host.firstChild); host.insertBefore(b, j[1]); host.insertBefore(j[0], b); host.insertBefore(t, j[0]);
+    const p = t.getBoundingClientRect(), q = b.getBoundingClientRect();
+    [t, b, ...j].forEach(n => n.remove()); return [p.left, p.top, q.left, q.bottom]; };
+  const probe = size => { const d = document.createElement('div');
+    d.style.cssText = 'position:absolute;left:0;top:0;margin:0;padding:0;border:0;white-space:nowrap;font-family:'
+      + cs.fontFamily + ';font-weight:' + cs.fontWeight + ';font-style:' + cs.fontStyle + ';font-size:' + size + 'px;line-height:' + lh;
+    d.textContent = 'x'; document.body.append(d); const s = span(d); d.remove(); return s[3] - s[1]; };
+  const [tx, ty, bx, by] = span(el), drawn = probe(F), k = drawn > 0 ? probe(1000) / 1000 * F / drawn : 1;
+  const x = tx + (bx - tx) * k, y = ty + (by - ty) * k;
+  return Math.abs(by - ty) >= Math.abs(bx - tx) ? [rect.left, y] : [x, rect.top];
+}"""
+
+
 # ----------------------------------------------------------------------------------------
-JS_HTML = r"""() => {
+JS_HTML = (r"""() => {
   const cal = [], texts = [], stickers = [], shapes = [], arrows = [], notes = [], noteStyles = [], inks = [];
-  // y is the first line's baseline: the bottom of a zero-size inline-block put before the first
-  // glyph. The Range box top would be the content-area top, which includes CSS half-leading that
-  // Chromium rounds to whole px at the rendered font size (2-3 px on large headings).
-  const baseline = el => { const k = document.createElement('span');
-    k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0';
-    el.insertBefore(k, el.firstChild); const y = k.getBoundingClientRect().bottom; k.remove(); return y; };
+  const baseline = BASELINE;
   const pt = (m, x, y) => [m.a*x + m.c*y + m.e + scrollX, m.b*x + m.d*y + m.f + scrollY];
   document.querySelectorAll('div.anchor[data-whiteboard-type]').forEach(a => {
     const st = a.getAttribute('style') || '', r = a.getBoundingClientRect();
@@ -117,8 +146,8 @@ JS_HTML = r"""() => {
     if (t.trim()) {
       const rg = document.createRange(), last = spans[spans.length - 1], lf = last.firstChild || last;
       rg.setStart(spans[0].firstChild || spans[0], 0); rg.setEnd(lf, lf.length || 0);
-      const b = rg.getBoundingClientRect(), y = baseline(spans[0]);
-      texts.push({type, text: t, x: b.left + scrollX, y: y + scrollY, w: b.width, h: b.height});
+      const b = rg.getBoundingClientRect(), [x, y] = baseline(spans[0], b);
+      texts.push({type, text: t, x: x + scrollX, y: y + scrollY, w: b.width, h: b.height});
     }
     if (type === 'ReactionStickers') {
       const i = a.querySelector('img').getBoundingClientRect();
@@ -159,7 +188,7 @@ JS_HTML = r"""() => {
   const bbox = all.length ? [Math.min(...all.map(r => r.left)) + scrollX, Math.min(...all.map(r => r.top)) + scrollY,
                              Math.max(...all.map(r => r.right)) + scrollX, Math.max(...all.map(r => r.bottom)) + scrollY] : null;
   return {cal, texts, stickers, shapes, arrows, notes, noteStyles, inks, bbox};
-}"""
+}""").replace("BASELINE", BASELINE, 1)
 
 
 def linfit(xs, ys):
@@ -292,15 +321,12 @@ JS_SVG = r"""() => [...document.querySelectorAll('foreignObject')].map(fo => {
   const rg = document.createRange(); rg.selectNodeContents(p.firstChild);
   const r = rg.getBoundingClientRect(), svg = document.querySelector('svg'), m = svg.getScreenCTM().inverse();
   const P = (x, y) => { const q = svg.createSVGPoint(); q.x = x; q.y = y; return q.matrixTransform(m); };
-  // y is the first line's baseline, measured as on the HTML side (zero-size inline-block marker).
-  const k = document.createElement('span');
-  k.style.cssText = 'display:inline-block;width:0;height:0;padding:0;border:0;margin:0';
-  p.insertBefore(k, p.firstChild); const kb = k.getBoundingClientRect().bottom; k.remove();
-  const a = P(r.left, kb), b = P(r.right, r.bottom), t = P(r.left, r.top);
+  // The first line's baseline, measured as on the HTML side.
+  const a = P(...(BASELINE)(p, r)), b = P(r.right, r.bottom), t = P(r.left, r.top);
   // Line breaks are <br> elements (Qt collapses raw newlines), which textContent drops.
   const text = [...p.childNodes].map(n => n.nodeName.toLowerCase() === 'br' ? '\n' : n.textContent).join('');
   return {text, x: a.x, y: a.y, h: b.y - t.y};
-}).filter(Boolean)"""
+}).filter(Boolean)""".replace("BASELINE", BASELINE, 1)
 
 
 def measure_ubz(page, ubz: Path, shot: Path) -> dict:
