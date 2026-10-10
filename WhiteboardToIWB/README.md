@@ -60,7 +60,8 @@ The run summary reports these when they occur.
 - **Stickers kept as SVG:** without Edge/Chrome, or with `-NoRasterize`, stickers stay SVG.
   OpenBoard shows them, but other IWB apps may not, because SVG isn't a CFF image format.
 - **Rotated notes, images and stickers** are drawn unrotated. None of the samples has any.
-- **Formatting:** note text is drawn in Segoe UI, not Whiteboard's Aptos.
+- **Formatting:** note text is drawn in Segoe UI, not Whiteboard's Aptos. It sits at
+  Whiteboard's baseline, but a long note can wrap at a different word.
 - **Ink:** each stroke is drawn at one width in one colour. A pressure-sensitive, highlighter or
   effect pen is approximated.
 - **Underline:** text keeps `text-decoration="underline"`, but OpenBoard's importer ignores it,
