@@ -156,12 +156,37 @@ JS_HTML = (r"""() => {
     const spans = [...a.querySelectorAll('span[data-text="true"]')];
     // Each Draft.js block (<div data-block>) is a paragraph: one line break between blocks.
     const blocks = [...a.querySelectorAll('div[data-block="true"]')];
-    const t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
-                            : spans.map(s => s.textContent).join('');
+    let t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
+                          : spans.map(s => s.textContent).join('');
+    // A shape's label is clipped by its text box (overflow-y: hidden), so compare the text that
+    // shows: cut at the first character (or empty paragraph) whose line is less than half inside
+    // the box, as Chromium lays it out, with trailing white space trimmed.
+    const tb = type === 'Shape' ? a.querySelector('.textbox.shapeText') : null;
+    let clipBottom = Infinity;
+    if (tb && blocks.length && tb.scrollHeight > tb.clientHeight + 1) {
+      const bottom = clipBottom = tb.getBoundingClientRect().bottom, rg = document.createRange(), out = r => (r.top + r.bottom) / 2 > bottom;
+      let cut = null, off = 0;
+      for (const b of blocks) {
+        const nodes = [...b.querySelectorAll('span[data-text="true"]')].map(s => s.firstChild).filter(n => n && n.nodeType === 3);
+        if (!nodes.length && out(b.getBoundingClientRect())) cut = off;
+        for (const n of nodes) {
+          for (let i = 0; i < n.length && cut === null; i++) {
+            rg.setStart(n, i); rg.setEnd(n, i + 1); const r = rg.getBoundingClientRect();
+            if (r.height && out(r)) cut = off + i;
+          }
+          if (cut !== null) break;
+          off += n.length;
+        }
+        if (cut !== null) break;
+        off += 1;   // the line break between blocks
+      }
+      if (cut !== null) t = t.slice(0, cut).trimEnd();
+    }
     if (t.trim()) {
       // Union of the visible characters' boxes. A range over the whole text would include the
       // spaces pre-wrap keeps at the end of a wrapped line; they hang past the column and are
-      // not used for alignment, so they would shift centred or right-aligned text.
+      // not used for alignment, so they would shift centred or right-aligned text. A clipped
+      // shape label counts only the lines that show.
       const rg = document.createRange(); let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       spans.forEach(s => {
         const w = document.createTreeWalker(s, NodeFilter.SHOW_TEXT); let n;
@@ -169,6 +194,7 @@ JS_HTML = (r"""() => {
           if (/\s/.test(n.data[i])) continue;
           rg.setStart(n, i); rg.setEnd(n, i + 1);
           for (const c of rg.getClientRects()) {
+            if ((c.top + c.bottom) / 2 > clipBottom) continue;
             x0 = Math.min(x0, c.left); y0 = Math.min(y0, c.top); x1 = Math.max(x1, c.right); y1 = Math.max(y1, c.bottom);
           }
         }

@@ -81,7 +81,8 @@ The run summary reports every item below when it occurs.
 - **Visual tests:** they measure the original board in headless Chromium and compare every
   text, note, shape, sticker, image, connector, arrowhead and ink stroke, and every note's
   colour, with the converted scene. Text is compared at its first baseline, and connectors
-  along their whole path. They
+  along their whole path. A shape label taller than its shape is compared as the lines
+  Whiteboard shows: the shape's text box clips it, and the converter keeps only those lines. They
   also fail any line of text that Excalidraw would clip. The report is written to
   `tests\out\visual\report.html`, and shows each board next to both converted scenes, drawn
   by Excalidraw's own exporter. Setup installs that exporter with npm, so it needs Node.js.

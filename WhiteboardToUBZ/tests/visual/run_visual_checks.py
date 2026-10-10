@@ -145,8 +145,31 @@ JS_HTML = (r"""() => {
     const spans = [...a.querySelectorAll('span[data-text="true"]')];
     // Each Draft.js block (<div data-block>) is a paragraph: one line break between blocks.
     const blocks = [...a.querySelectorAll('div[data-block="true"]')];
-    const t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
-                            : spans.map(s => s.textContent).join('');
+    let t = blocks.length ? blocks.map(b => [...b.querySelectorAll('span[data-text="true"]')].map(s => s.textContent).join('')).join('\n')
+                          : spans.map(s => s.textContent).join('');
+    // A shape's label is clipped by its text box (overflow-y: hidden), so compare the text that
+    // shows: cut at the first character (or empty paragraph) whose line is less than half inside
+    // the box, as Chromium lays it out, with trailing white space trimmed.
+    const tb = type === 'Shape' ? a.querySelector('.textbox.shapeText') : null;
+    if (tb && blocks.length && tb.scrollHeight > tb.clientHeight + 1) {
+      const bottom = tb.getBoundingClientRect().bottom, rg = document.createRange(), out = r => (r.top + r.bottom) / 2 > bottom;
+      let cut = null, off = 0;
+      for (const b of blocks) {
+        const nodes = [...b.querySelectorAll('span[data-text="true"]')].map(s => s.firstChild).filter(n => n && n.nodeType === 3);
+        if (!nodes.length && out(b.getBoundingClientRect())) cut = off;
+        for (const n of nodes) {
+          for (let i = 0; i < n.length && cut === null; i++) {
+            rg.setStart(n, i); rg.setEnd(n, i + 1); const r = rg.getBoundingClientRect();
+            if (r.height && out(r)) cut = off + i;
+          }
+          if (cut !== null) break;
+          off += n.length;
+        }
+        if (cut !== null) break;
+        off += 1;   // the line break between blocks
+      }
+      if (cut !== null) t = t.slice(0, cut).trimEnd();
+    }
     if (t.trim()) {
       // The first paragraph only: a Range across several Draft.js blocks also spans the blocks'
       // own boxes, so it is the column's full width (the output side stops at the first <br>).

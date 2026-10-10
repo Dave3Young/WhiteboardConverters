@@ -1049,6 +1049,77 @@ begin {
         return $script:FontLineMetrics[$key]
     }
 
+    function Get-TextMeasurer {
+        # A scriptblock giving a string's advance width in px in the given face (System.Drawing,
+        # typographic layout). Without the face or System.Drawing, 0.58 em per character.
+        param([string]$Family, [double]$FontSize, [int]$Weight = 400, [bool]$Italic = $false)
+        $font = $null
+        if ((Get-InstalledFontNames).Contains($Family)) {
+            try {
+                $style = [Drawing.FontStyle]::Regular
+                if ($Weight -ge 600) { $style = $style -bor [Drawing.FontStyle]::Bold }
+                if ($Italic) { $style = $style -bor [Drawing.FontStyle]::Italic }
+                $font = New-Object Drawing.Font($Family, [single]$FontSize, $style, [Drawing.GraphicsUnit]::Pixel)
+                if ($null -eq $script:MeasureGraphics) {
+                    $script:MeasureGraphics = [Drawing.Graphics]::FromImage((New-Object Drawing.Bitmap 1, 1))
+                    $script:MeasureGraphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAlias
+                    $script:MeasureFormat = [Drawing.StringFormat]::GenericTypographic.Clone()
+                    $script:MeasureFormat.FormatFlags = $script:MeasureFormat.FormatFlags -bor [Drawing.StringFormatFlags]::MeasureTrailingSpaces
+                }
+            } catch { $font = $null }
+        }
+        if ($null -eq $font) {
+            $em = $FontSize * 0.58
+            return { param([string]$s) $s.Length * $em }.GetNewClosure()
+        }
+        $g = $script:MeasureGraphics; $f = $script:MeasureFormat; $origin = New-Object Drawing.PointF 0, 0
+        return { param([string]$s) if ($s.Length -eq 0) { 0.0 } else { [double]$g.MeasureString($s, $font, $origin, $f).Width } }.GetNewClosure()
+    }
+
+    function Get-TextLineStarts {
+        # Where each line of a text box starts, as character offsets into $Text, wrapped as a
+        # browser wraps it: each paragraph on its own, greedily at spaces (trailing spaces
+        # hang), and a word wider than the column broken between characters.
+        param([string]$Text, [double]$Width, [scriptblock]$Measure)
+        $starts = New-Object Collections.Generic.List[int]
+        $offset = 0
+        foreach ($paragraph in ($Text -split "`n")) {
+            $starts.Add($offset)
+            $lineStart = 0; $pos = 0
+            while ($pos -lt $paragraph.Length) {
+                $wordEnd = $pos
+                while ($wordEnd -lt $paragraph.Length -and $paragraph[$wordEnd] -ne ' ') { $wordEnd++ }
+                if ((& $Measure $paragraph.Substring($lineStart, $wordEnd - $lineStart)) -le $Width + 0.01) {
+                    $pos = $wordEnd
+                    while ($pos -lt $paragraph.Length -and $paragraph[$pos] -eq ' ') { $pos++ }
+                } elseif ($pos -gt $lineStart) {
+                    $starts.Add($offset + $pos); $lineStart = $pos
+                } else {
+                    $end = $lineStart + 1
+                    while ($end -lt $wordEnd -and (& $Measure $paragraph.Substring($lineStart, $end + 1 - $lineStart)) -le $Width + 0.01) { $end++ }
+                    $starts.Add($offset + $end); $lineStart = $end; $pos = $end
+                }
+            }
+            $offset += $paragraph.Length + 1
+        }
+        return ,($starts.ToArray())
+    }
+
+    function Select-TextRuns {
+        # The runs cut to their first $Length characters.
+        param([object[]]$Runs, [int]$Length)
+        $kept = New-Object Collections.Generic.List[object]
+        $left = $Length
+        foreach ($r in $Runs) {
+            if ($left -le 0) { break }
+            $copy = $r.PSObject.Copy()
+            if ($copy.Text.Length -gt $left) { $copy.Text = $copy.Text.Substring(0, $left) }
+            $left -= $copy.Text.Length
+            [void]$kept.Add($copy)
+        }
+        return ,($kept.ToArray())
+    }
+
     function Test-Underline {
         # Whiteboard underlines a whole text box with text-decoration on its textBoxCore div.
         param([string]$Style)
@@ -1513,11 +1584,14 @@ begin {
                     if ($null -eq $g.Runs) {
                         [void]$sb.Append(((@($g.Text -split "`n") | ForEach-Object { ConvertTo-XmlText $_ }) -join '<svg:tbreak/>'))
                     } else {
-                        # Runs with their own bold, italic, underline or strikethrough as tspans.
+                        # Every run is a tspan that sets its weight and style. OpenBoard's importer
+                        # applies each tspan to one shared format and never restores it, so text
+                        # after a tspan (or a tspan without its own weight) took the previous run's
+                        # bold or italic: "Profess|i|onal" imported as "Prof" + bold "essi" + bold
+                        # italic "onal".
                         foreach ($r in $g.Runs) {
-                            $attrs = ''
-                            if ($null -ne $r.Weight) { $attrs += ' font-weight="{0}"' -f $(if ($r.Weight -ge 700) { 'bold' } elseif ($r.Weight -ge 600) { 'demibold' } else { 'normal' }) }
-                            if ($r.Italic) { $attrs += ' font-style="italic"' }
+                            $runWeight = if ($null -eq $r.Weight) { $weight } elseif ($r.Weight -ge 700) { 'bold' } elseif ($r.Weight -ge 600) { 'demibold' } else { 'normal' }
+                            $attrs = ' font-weight="{0}" font-style="{1}"' -f $runWeight, $(if ($r.Italic -or $g.Italic) { 'italic' } else { 'normal' })
                             $lines = @()
                             if ($r.Underline) { $lines += 'underline' }
                             if ($r.Strike) { $lines += 'line-through' }
@@ -1606,7 +1680,7 @@ begin {
         $sourceTypes = @{}
         $dashedCount = 0
         $stickerImageCount = 0; $stickerFallbackCount = 0
-        $shapeTracedCount = 0; $shapeFallbackCount = 0; $shapeEdgesCount = 0
+        $shapeTracedCount = 0; $shapeFallbackCount = 0; $shapeEdgesCount = 0; $shapeTextClippedCount = 0; $shapeLinesHiddenCount = 0
         $underlineDrawn = 0; $underlineNotDrawn = 0
         $rotatedTextCount = 0; $rotatedShapeCount = 0; $rotationIgnored = [Collections.Generic.List[string]]::new()
         $arrowheadCount = 0
@@ -1681,13 +1755,35 @@ begin {
                         $fontLocal = Get-CssNumber $shapeTextStyle 'font-size' 20
                         $innerWidth = Get-CssNumber $shapeTextStyle 'width' ([Math]::Max(1.0, $lw - 26))
                         $innerHeight = Get-CssNumber $shapeTextStyle 'height' ([Math]::Max(1.0, $lh - 26))
-                        $textHeight = [Math]::Min($innerHeight, $fontLocal * 1.25 * (Get-TextLineCount $shapeText $innerWidth $fontLocal))
+                        $shapeWeight = Get-FontWeight $shapeCoreStyle 700
+                        $shapeFamily = Get-FontFamily $shapeCoreStyle $simpleFamily
+                        # The label is a flex column centred in the shape's text box, which has
+                        # overflow-y: hidden. Text taller than the box starts at its top instead,
+                        # and Whiteboard shows only the lines that fit; it used to be drawn whole,
+                        # running far past the shape. Lines at least half inside are kept.
+                        $shapeLineHeight = Get-LineHeight $shapeCoreStyle $fontLocal
+                        if ($shapeLineHeight -le 0) {
+                            $metrics = Get-FontLineMetrics $shapeFamily $shapeWeight
+                            $shapeLineHeight = if ($null -ne $metrics) { $metrics.Normal } else { 1.25 }
+                        }
+                        $linePx = $shapeLineHeight * $fontLocal
+                        $lineStarts = Get-TextLineStarts $shapeText $innerWidth (Get-TextMeasurer $shapeFamily $fontLocal $shapeWeight (Test-Italic $shapeCoreStyle))
+                        $textHeight = $lineStarts.Count * $linePx
+                        if ($textHeight -gt $innerHeight + 0.01) {
+                            $textHeight = $innerHeight
+                            $visibleLines = [Math]::Max(1, [int][Math]::Floor(($innerHeight / $linePx) + 0.5))
+                            if ($visibleLines -lt $lineStarts.Count) {
+                                $shapeText = $shapeText.Substring(0, $lineStarts[$visibleLines]).TrimEnd()
+                                $shapeRuns = Select-TextRuns $shapeRuns $shapeText.Length
+                                $shapeTextClippedCount++
+                                $shapeLinesHiddenCount += $lineStarts.Count - $visibleLines
+                            }
+                        }
+                        if (-not $shapeText) { break }
                         $origin = ConvertTo-BoardPoints $a @(,[double[]]@(($u0 + (($lw - $innerWidth) / 2)), ($v0 + (($lh - $textHeight) / 2))))
                         $textColor = Convert-RgbaToHex (Get-StyleValue $shapeCoreStyle 'color') '#000000'
                         $textAlign = if ($block -match 'DraftEditor-alignRight') { 'right' } elseif ($block -match 'DraftEditor-alignCenter') { 'center' } else { 'left' }
-                        $shapeWeight = Get-FontWeight $shapeCoreStyle 700
                         $shapeUnderline = Test-Underline $shapeCoreStyle
-                        $shapeFamily = Get-FontFamily $shapeCoreStyle $simpleFamily
                         $shapeStyled = Test-StyledRuns $shapeRuns
                         if ($shapeStyled) { $styledRunTexts++ }
                         # The text box turns with the shape.
@@ -1990,6 +2086,7 @@ begin {
             StickersEmbedded = $stickerImageCount; StickersFallback = $stickerFallbackCount
             ImagesKeptAsSvg = $keptAsSvg; ImagesKeptAsWebp = $keptAsWebp
             ShapesTraced = $shapeTracedCount; ShapesFromLabel = $shapeFallbackCount; ShapesAsEdges = $shapeEdgesCount
+            ShapeTextClipped = $shapeTextClippedCount; ShapeTextLinesHidden = $shapeLinesHiddenCount
             RotatedTextConverted = $rotatedTextCount; RotatedShapesConverted = $rotatedShapeCount
             RotationIgnored = $rotationIgnored.Count; RotationIgnoredDetails = @($rotationIgnored)
             ArrowheadsConverted = $arrowheadCount
@@ -2042,6 +2139,9 @@ process {
         if ($result.RotatedImagesConverted -gt 0) {
             Write-Host ("  {0} rotated image(s)/sticker(s) converted with their rotation." -f $result.RotatedImagesConverted)
         }
+        if ($result.ShapeTextClipped -gt 0) {
+            Write-Host ("  {0} shape label(s) taller than their shape were cut to the lines Whiteboard shows ({1} line(s) hidden)." -f $result.ShapeTextClipped, $result.ShapeTextLinesHidden)
+        }
         if ($result.ConnectorsEmpty -gt 0) {
             Write-Host ("  {0} zero-length connector(s) skipped (Whiteboard draws nothing for them)." -f $result.ConnectorsEmpty)
         }
@@ -2084,7 +2184,7 @@ process {
             Write-Warning ("{0} underlined text(s) are wrapped or rotated, so only carry text-decoration: OpenBoard shows them without an underline." -f $result.UnderlinesNotDrawn)
         }
         if ($result.StyledRunTexts -gt 0) {
-            Write-Warning ("{0} text(s) are partly bold, italic or underlined: kept as tspans, but OpenBoard's importer may show the whole text in one style." -f $result.StyledRunTexts)
+            Write-Warning ("{0} text(s) are partly bold, italic or underlined: kept as tspans. OpenBoard's importer shows their bold and italic, but not underlining, and drops the spaces at the edges of each run." -f $result.StyledRunTexts)
         }
         if ($result.UnsupportedObjects -gt 0) {
             Write-Warning ("{0} object(s) were unsupported. Details: {1}" -f `
